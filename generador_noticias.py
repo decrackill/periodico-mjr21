@@ -140,7 +140,6 @@ def docx_a_cuerpo(ruta_docx, carpeta_slug, slug):
     doc = Document(str(ruta_docx))
     parrafo_map = {p._element: p for p in doc.paragraphs}
     tabla_map   = {t._element: t for t in doc.tables}
-
     mapa_rid = extraer_imagenes_docx(ruta_docx, carpeta_slug) if carpeta_slug else {}
 
     bloques = []
@@ -210,266 +209,360 @@ def primer_titulo(ruta_docx):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONVERSIÓN PDF → HTML
+#  CONVERSIÓN PDF → HTML  (reescrita completa)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _color_rgb(c):
     return ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)
 
 
-def _similar_color(c1, c2, tol=35):
+def _similar_color(c1, c2, tol=40):
     return all(abs(a - b) <= tol for a, b in zip(c1, c2))
 
 
-# Colores de referencia del PDF MJR-21
-_AZUL     = (26, 63, 160)   # encabezados sección, celda izq tabla
-_ROJO     = (192, 57, 43)   # subsección, acento
-_BLANCO   = (255, 255, 255) # texto sobre fondo azul (header tabla)
-_GRIS     = (136, 136, 136) # pie de página
-_OSCURO   = (30, 30, 46)    # texto cuerpo
+# Paleta del PDF MJR-21
+_AZUL_OSC  = (26,  63,  160)   # encabezados romanos, celdas izq tabla
+_AZUL_MED  = (0,   70,  127)   # variante azul medio
+_ROJO      = (192, 57,  43)    # subsecciones N.N Título
+_ROJO_OSC  = (180, 0,   0)     # variante rojo oscuro
+_SALMON    = (255, 180, 160)   # fondo de encabezados romanos grandes
+_BLANCO    = (255, 255, 255)   # texto blanco en header de tabla
+_GRIS      = (130, 130, 130)   # pie de página, números
+_GRIS_CLR  = (160, 160, 160)   # gris más claro
+_NEGRO     = (0,   0,   0)     # texto cuerpo negro puro
+_OSCURO    = (30,  30,  46)    # texto cuerpo oscuro
+_VERDE     = (0,   128, 0)     # variante verde tabla
+
+
+def _es_azul(rgb):
+    return _similar_color(rgb, _AZUL_OSC) or _similar_color(rgb, _AZUL_MED, 30)
+
+
+def _es_rojo(rgb):
+    return _similar_color(rgb, _ROJO) or _similar_color(rgb, _ROJO_OSC, 30)
+
+
+def _es_gris(rgb):
+    return _similar_color(rgb, _GRIS, 30) or _similar_color(rgb, _GRIS_CLR, 30)
+
+
+def _es_oscuro(rgb):
+    return (_similar_color(rgb, _OSCURO, 40)
+            or _similar_color(rgb, _NEGRO, 40)
+            or (rgb[0] < 80 and rgb[1] < 80 and rgb[2] < 80))
+
+
+def _es_blanco(rgb):
+    return all(c >= 220 for c in rgb)
 
 
 def _escape(t):
     return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _es_logo(img_bbox, page_height, w, h):
+    """Detecta logos de encabezado/pie: pequeños y en zona marginal."""
+    x0, y0, x1, y1 = img_bbox
+    en_header = y0 < page_height * 0.22
+    en_footer  = y1 > page_height * 0.82
+    pequena    = w < 200 or h < 200
+    return (en_header or en_footer) and pequena
+
+
 def pdf_a_cuerpo(ruta_pdf, carpeta_slug, slug):
     """
-    Convierte un PDF a HTML estructurado respetando:
-    - Encabezados por tamaño y color
-    - Tablas de dos columnas (disposición | contenido)
-    - Párrafos normales
-    - Imágenes inline (desde página 2 en adelante para saltar portada)
+    Convierte PDF → HTML con manejo robusto de:
+    - Encabezados romanos grandes (I., II., ...) que pueden partir en varias líneas
+    - Subsecciones N.N en rojo
+    - Tablas de 2 columnas con detección de columna por posición X absoluta
+    - Imágenes inline sin logos de encabezado/pie
     """
-    doc = fitz.open(str(ruta_pdf))
-    bloques_html = []
+    doc    = fitz.open(str(ruta_pdf))
+    output = []          # bloques HTML finales
+    xrefs_vistos = set()
+
     carpeta_img = None
     img_counter = 0
-
     if carpeta_slug:
         carpeta_img = carpeta_slug / "img_inline"
         carpeta_img.mkdir(parents=True, exist_ok=True)
 
     for num_pag, pagina in enumerate(doc):
-        # ── Extraer imágenes (saltamos portada pág 0) ──────────────────────
+        page_rect   = pagina.rect
+        page_w      = page_rect.width
+        page_h      = page_rect.height
+
+        # ── Imágenes (saltar portada pág 0) ───────────────────────────────
         if carpeta_img and num_pag > 0:
             for img_info in pagina.get_images(full=True):
                 xref = img_info[0]
+                if xref in xrefs_vistos:
+                    continue
                 base = doc.extract_image(xref)
-                if base["width"] < 80 or base["height"] < 80:
-                    continue  # skip iconos pequeños
-                ext = base["ext"]
+                iw, ih = base["width"], base["height"]
+                bbox_list = pagina.get_image_rects(xref)
+                bbox = bbox_list[0] if bbox_list else None
+                if bbox and _es_logo(bbox, page_h, iw, ih):
+                    xrefs_vistos.add(xref)
+                    continue
+                if iw < 80 or ih < 80:
+                    xrefs_vistos.add(xref)
+                    continue
+                xrefs_vistos.add(xref)
+                ext    = base["ext"]
                 nombre = f"pdf_img_{img_counter}.{ext}"
-                destino = carpeta_img / nombre
-                with open(destino, "wb") as f:
-                    f.write(base["image"])
+                (carpeta_img / nombre).write_bytes(base["image"])
                 ruta_pub = f"/img/articulos/{slug}/img_inline/{nombre}"
-                bloques_html.append(
+                output.append(
                     f'<figure class="article-inline-img">'
-                    f'<img src="{ruta_pub}" alt="Imagen" loading="lazy">'
-                    f'</figure>'
+                    f'<img src="{ruta_pub}" alt="Imagen" loading="lazy"></figure>'
                 )
                 img_counter += 1
 
-        # ── Extraer spans con posición ──────────────────────────────────────
-        raw_bloques = pagina.get_text("rawdict", flags=0)["blocks"]
-        spans_pag = []  # (y, x, size, bold, italic, rgb, text)
+        # ── Extraer todos los spans de la página ──────────────────────────
+        raw = pagina.get_text("rawdict", flags=0)["blocks"]
+        spans = []   # (y0, x0, x1, size, bold, italic, rgb, text, bbox_bloque_y0)
 
-        for b in raw_bloques:
-            if b["type"] != 0:
+        for blk in raw:
+            if blk["type"] != 0:
                 continue
-            for linea in b["lines"]:
-                y = linea["bbox"][1]
-                x = linea["bbox"][0]
+            for linea in blk["lines"]:
+                ly0 = linea["bbox"][1]
+                lx0 = linea["bbox"][0]
+                lx1 = linea["bbox"][2]
                 for span in linea["spans"]:
                     chars = span.get("chars", [])
-                    text = "".join(c["c"] for c in chars).strip()
+                    text  = "".join(c["c"] for c in chars).strip()
                     if not text:
                         continue
-                    rgb = _color_rgb(span["color"])
-                    sz  = span["size"]
-                    fl  = span["flags"]
-                    bold   = bool(fl & 2**4)
-                    italic = bool(fl & 2**1)
-                    spans_pag.append((y, x, sz, bold, italic, rgb, text))
+                    rgb    = _color_rgb(span["color"])
+                    sz     = span["size"]
+                    fl     = span["flags"]
+                    bold   = bool(fl & 16)
+                    italic = bool(fl & 2)
+                    spans.append((ly0, lx0, lx1, sz, bold, italic, rgb, text))
 
-        # ── Agrupar en líneas (misma Y ± 4px) ──────────────────────────────
-        lineas_pag = []
-        for item in sorted(spans_pag, key=lambda s: (round(s[0] / 4), s[1])):
-            y = item[0]
-            if lineas_pag and abs(y - lineas_pag[-1][0][0]) < 4:
-                lineas_pag[-1].append(item)
+        if not spans:
+            continue
+
+        # ── Calcular X de separación de columnas en tablas ─────────────────
+        # Estrategia: buscar spans oscuros/negros con X > 35% del ancho de página
+        # Esos son la columna derecha. El mínimo X de esos = límite de columna.
+        xs_col_der = [
+            s[1] for s in spans
+            if (_es_oscuro(s[6]) or _es_blanco(s[6]))
+            and s[1] > page_w * 0.35
+        ]
+        col_split = min(xs_col_der) if xs_col_der else page_w * 0.40
+
+        # ── Agrupar spans en líneas por Y (tolerancia 5px) ────────────────
+        spans_sorted = sorted(spans, key=lambda s: (round(s[0] / 5) * 5, s[1]))
+        lineas = []
+        for sp in spans_sorted:
+            y = sp[0]
+            if lineas and abs(y - lineas[-1][0][0]) <= 5:
+                lineas[-1].append(sp)
             else:
-                lineas_pag.append([item])
+                lineas.append([sp])
 
-        # ── Detectar umbral X de columna derecha de tabla ──────────────────
-        # Las líneas oscuras de cuerpo de tabla tienen X > ~180
-        xs_cuerpo = [grupo[0][1] for grupo in lineas_pag
-                     if _similar_color(grupo[0][5], _OSCURO)
-                     and grupo[0][1] > 150]
-        umbral_col_derecha = min(xs_cuerpo) if xs_cuerpo else 200
+        # ── Estado de máquina para tabla ──────────────────────────────────
+        en_tabla       = False
+        filas_tabla    = []
+        buf_izq        = []   # spans de celda izquierda actual
+        buf_der        = []   # spans de celda derecha actual
+        # Para fusionar encabezados partidos en varias líneas
+        buf_h2         = []   # líneas de un encabezado romano en construcción
+        buf_h3         = []   # líneas de subsección en construcción
 
-        # ── Estado de tabla ─────────────────────────────────────────────────
-        en_tabla      = False
-        celda_izq_buf = []   # líneas acumuladas de columna izquierda
-        celda_der_buf = []   # líneas acumuladas de columna derecha
-        filas_tabla   = []   # filas HTML completas
+        def _flush_h2():
+            if buf_h2:
+                texto = " ".join(buf_h2).strip()
+                output.append(
+                    f'<h2 style="color:#1a3fa0;border-left:5px solid #1a3fa0;'
+                    f'padding-left:0.7em;margin:1.8em 0 0.4em;font-size:1.2rem">'
+                    f'{_escape(texto)}</h2>'
+                )
+                buf_h2.clear()
 
-        def _volcar_celda_pendiente():
-            """Cierra fila de tabla cuando cambia la celda izquierda."""
-            if celda_izq_buf or celda_der_buf:
-                izq = " ".join(celda_izq_buf)
-                der = " ".join(celda_der_buf)
-                izq_html = _escape(izq)
-                der_html = _escape(der)
+        def _flush_h3():
+            if buf_h3:
+                texto = " ".join(buf_h3).strip()
+                output.append(
+                    f'<h3 style="color:#c0392b;margin:1.3em 0 0.3em;font-size:1.05rem">'
+                    f'{_escape(texto)}</h3>'
+                )
+                buf_h3.clear()
+
+        def _flush_fila():
+            """Cierra la fila actual de tabla."""
+            if buf_izq or buf_der:
+                izq = " ".join(buf_izq).strip()
+                der = " ".join(buf_der).strip()
                 filas_tabla.append(
                     f"<tr>"
-                    f'<td><strong style="color:#1a3fa0">{izq_html}</strong></td>'
-                    f"<td>{der_html}</td>"
+                    f'<td><strong style="color:#1a3fa0">{_escape(izq)}</strong></td>'
+                    f"<td>{_escape(der)}</td>"
                     f"</tr>"
                 )
-                celda_izq_buf.clear()
-                celda_der_buf.clear()
+                buf_izq.clear()
+                buf_der.clear()
 
-        def _volcar_tabla():
+        def _flush_tabla():
             nonlocal en_tabla
-            _volcar_celda_pendiente()
+            _flush_fila()
             if filas_tabla:
-                header = (
+                hdr = (
                     "<tr>"
-                    '<th style="background:#1a3fa0;color:#fff">DISPOSICIÓN CONSTITUCIONAL</th>'
-                    '<th style="background:#1a3fa0;color:#fff">CONTENIDO DE LA PROPUESTA</th>'
+                    '<th style="background:#1a3fa0;color:#fff;padding:.5rem .8rem">DISPOSICIÓN CONSTITUCIONAL</th>'
+                    '<th style="background:#1a3fa0;color:#fff;padding:.5rem .8rem">CONTENIDO DE LA PROPUESTA</th>'
                     "</tr>"
                 )
-                bloques_html.append(
-                    f'<div class="table-wrap"><table>{header}{"".join(filas_tabla)}</table></div>'
+                output.append(
+                    f'<div class="table-wrap"><table>{hdr}{"".join(filas_tabla)}</table></div>'
                 )
                 filas_tabla.clear()
             en_tabla = False
 
-        for grupo in lineas_pag:
-            y0   = grupo[0][0]
-            x0   = grupo[0][1]
-            sz0  = grupo[0][2]
-            bold0 = grupo[0][3]
-            rgb0 = grupo[0][5]
+        for linea in lineas:
+            # Propiedades representativas de la línea (primer span)
+            y0    = linea[0][0]
+            x0    = linea[0][1]
+            sz0   = linea[0][3]
+            bold0 = linea[0][4]
+            rgb0  = linea[0][6]
 
             # Texto completo de la línea
-            texto_linea = " ".join(item[6] for item in grupo).strip()
-            if not texto_linea:
+            texto = " ".join(sp[7] for sp in linea).strip()
+            if not texto:
                 continue
 
-            # ── Ignorar encabezado/pie de página ───────────────────────────
-            if _similar_color(rgb0, _GRIS):
+            # ── Filtros de ruido ───────────────────────────────────────────
+            # Encabezado/pie gris
+            if _es_gris(rgb0):
                 continue
-            # Header de la organización (azul pequeño, primera línea de página)
-            if _similar_color(rgb0, _AZUL) and sz0 <= 10 and "MOVIMIENTO" in texto_linea:
+            # Logo del movimiento en encabezado (azul, zona alta, texto corto)
+            if _es_azul(rgb0) and sz0 <= 11 and y0 < page_h * 0.18:
                 continue
             # Número de página
-            if re.match(r'^Pág\.\s*\d+', texto_linea):
+            if re.match(r'^\s*Pág\.\s*\d+\s*$', texto) or re.match(r'^\s*\d+\s*$', texto):
+                continue
+            # Líneas decorativas (solo guiones, puntos o muy cortas sin letras)
+            if len(texto) < 3 and not any(c.isalpha() for c in texto):
                 continue
 
-            # ── Texto blanco = encabezado de tabla (DISPOSICIÓN / CONTENIDO) ─
-            if _similar_color(rgb0, _BLANCO):
-                # Inicio de tabla: volcamos lo anterior si había párrafos
+            # ── Texto blanco → encabezado de tabla ────────────────────────
+            if _es_blanco(rgb0):
+                # Si el texto dice "DISPOSICIÓN" o "CONTENIDO" es header de tabla
+                _flush_h2()
+                _flush_h3()
                 en_tabla = True
+                # No agregar nueva fila — el header lo ponemos nosotros
                 continue
 
-            # ── Encabezado principal (azul grande ≥ 14pt) ──────────────────
-            if _similar_color(rgb0, _AZUL) and sz0 >= 13:
-                if en_tabla:
-                    _volcar_tabla()
-                txt = _escape(texto_linea)
-                bloques_html.append(
-                    f'<h2 style="color:#1a3fa0;border-left:4px solid #1a3fa0;'
-                    f'padding-left:0.6em;margin:1.5em 0 0.4em">{txt}</h2>'
-                )
+            # ── Encabezado romano grande (azul, sz >= 12, empieza con I/II/III/IV/V/VI...)
+            # O simplemente azul grande que no es encabezado de tabla
+            if _es_azul(rgb0) and sz0 >= 12 and not en_tabla:
+                # ¿Es continuación del encabezado anterior (misma sección)?
+                # Heurística: si buf_h2 no está vacío y la línea actual
+                # no empieza con número romano ni con dígito, es continuación
+                es_inicio_seccion = bool(re.match(
+                    r'^(I{1,3}|IV|V?I{0,3}|IX|X)\b|^\d+\b', texto.strip()
+                ))
+                if buf_h2 and not es_inicio_seccion:
+                    buf_h2.append(texto)
+                else:
+                    _flush_h2()
+                    buf_h2.append(texto)
+                _flush_h3()
                 continue
 
-            # ── Subsección (rojo/naranja ≥ 11pt) ───────────────────────────
-            if (_similar_color(rgb0, _ROJO) or _similar_color(rgb0, (192,57,43), 40)) and sz0 >= 10:
-                if en_tabla:
-                    _volcar_tabla()
-                txt = _escape(texto_linea)
-                bloques_html.append(
-                    f'<h3 style="color:#c0392b;margin:1.2em 0 0.3em">{txt}</h3>'
-                )
+            # ── Subsección en rojo (N.N Título...) ────────────────────────
+            if _es_rojo(rgb0) and not en_tabla:
+                # ¿Continuación de h3 anterior?
+                es_inicio_sub = bool(re.match(r'^\d+\.\d+', texto.strip()))
+                if buf_h3 and not es_inicio_sub:
+                    buf_h3.append(texto)
+                else:
+                    _flush_h3()
+                    _flush_h2()
+                    buf_h3.append(texto)
                 continue
 
-            # ── Contenido dentro de tabla ───────────────────────────────────
+            # ── Contenido de tabla ─────────────────────────────────────────
             if en_tabla:
-                # Celda izquierda: azul bold, x < umbral
-                if _similar_color(rgb0, _AZUL) and bold0 and x0 < umbral_col_derecha - 20:
-                    # Nueva celda izquierda: volcar fila anterior
-                    if celda_der_buf:
-                        _volcar_celda_pendiente()
-                    celda_izq_buf.append(texto_linea)
-                # Celda derecha: texto oscuro, x >= umbral O continuación
-                elif _similar_color(rgb0, _OSCURO) and not bold0:
-                    celda_der_buf.append(texto_linea)
-                # Azul bold a la derecha (título celda der a veces)
-                elif _similar_color(rgb0, _AZUL) and bold0 and x0 >= umbral_col_derecha - 20:
-                    celda_der_buf.append(texto_linea)
-                # Parágrafo azul normal entre tablas
-                elif _similar_color(rgb0, _AZUL) and not bold0:
-                    if en_tabla:
-                        _volcar_tabla()
-                    txt = _escape(texto_linea)
-                    bloques_html.append(f"<p><em>{txt}</em></p>")
+                # Determinar columna por posición X
+                es_col_izq = x0 < col_split
+
+                if es_col_izq and _es_azul(rgb0):
+                    # Nueva celda izquierda: si ya había contenido derecho, cerrar fila
+                    if buf_der:
+                        _flush_fila()
+                    elif buf_izq and not buf_der:
+                        # Continuación de celda izquierda (texto largo)
+                        pass
+                    buf_izq.append(texto)
+
+                elif not es_col_izq:
+                    # Columna derecha (cualquier color oscuro o negro)
+                    buf_der.append(texto)
+
+                elif es_col_izq and (_es_oscuro(rgb0) or _es_rojo(rgb0)):
+                    # Texto oscuro en columna izquierda → también columna izquierda
+                    buf_izq.append(texto)
+
+                # Detectar fin de tabla: si aparece texto azul grande
+                # que claramente es un h2 (empieza con romano + sz >= 12)
+                # → se maneja en la siguiente iteración porque flush_tabla
+                #   se llama antes de agregar h2
                 continue
 
-            # ── Párrafo normal ──────────────────────────────────────────────
-            if _similar_color(rgb0, _OSCURO) or (not _similar_color(rgb0, _AZUL)
-                                                   and not _similar_color(rgb0, _ROJO)):
-                # Parágrafo con posible bold/italic
-                partes = []
-                for item in grupo:
-                    t = _escape(item[6])
-                    if item[3] and item[4]:
-                        t = f"<strong><em>{t}</em></strong>"
-                    elif item[3]:
-                        t = f"<strong>{t}</strong>"
-                    elif item[4]:
-                        t = f"<em>{t}</em>"
-                    partes.append(t)
-                bloques_html.append(f"<p>{''.join(partes)}</p>")
-                continue
+            # ── Párrafo normal ─────────────────────────────────────────────
+            _flush_h2()
+            _flush_h3()
 
-            # ── Texto azul no clasificado (parágrafo azul) ─────────────────
-            if _similar_color(rgb0, _AZUL):
-                txt = _escape(texto_linea)
-                bloques_html.append(f'<p style="color:#1a3fa0"><em>{txt}</em></p>')
+            partes_html = []
+            for sp in linea:
+                t = _escape(sp[7])
+                if sp[4] and sp[5]:   # bold + italic
+                    t = f"<strong><em>{t}</em></strong>"
+                elif sp[4]:           # bold
+                    t = f"<strong>{t}</strong>"
+                elif sp[5]:           # italic
+                    t = f"<em>{t}</em>"
+                partes_html.append(t)
 
-        # Cerrar tabla abierta al final de la página
+            output.append(f"<p>{''.join(partes_html)}</p>")
+
+        # Cerrar tabla/encabezados al final de página
         if en_tabla:
-            _volcar_tabla()
+            _flush_tabla()
+        _flush_h2()
+        _flush_h3()
 
     doc.close()
 
-    # ── Post-proceso: fusionar <p> consecutivos del mismo bloque ───────────
+    # ── Post-proceso: fusionar <p> consecutivos ────────────────────────────
     resultado = []
-    buf_p = []
+    buf_p     = []
 
-    def volcar_p():
+    def _volcar_p():
         if buf_p:
             resultado.append("<p>" + " ".join(buf_p) + "</p>")
             buf_p.clear()
 
-    for bloque in bloques_html:
-        if bloque.startswith("<p>") and not bloque.startswith('<p style'):
-            # Extraer contenido
+    for bloque in output:
+        if bloque.startswith("<p>") and "<figure" not in bloque:
             inner = re.sub(r'^<p>(.*)</p>$', r'\1', bloque, flags=re.DOTALL)
             buf_p.append(inner)
         else:
-            volcar_p()
+            _volcar_p()
             resultado.append(bloque)
-    volcar_p()
+    _volcar_p()
 
     return "\n\n".join(resultado)
 
 
 def primer_titulo_pdf(ruta_pdf):
-    """Extrae el título más prominente del PDF (mayor tamaño de fuente)."""
     doc = fitz.open(str(ruta_pdf))
     candidatos = []
     for pagina in doc:
@@ -479,10 +572,10 @@ def primer_titulo_pdf(ruta_pdf):
             for linea in b["lines"]:
                 for span in linea["spans"]:
                     chars = span.get("chars", [])
-                    text = "".join(c["c"] for c in chars).strip()
+                    text  = "".join(c["c"] for c in chars).strip()
                     if text and span["size"] >= 12:
                         rgb = _color_rgb(span["color"])
-                        if not _similar_color(rgb, _GRIS) and not _similar_color(rgb, _BLANCO):
+                        if not _es_gris(rgb) and not _es_blanco(rgb):
                             candidatos.append((span["size"], text))
         if candidatos:
             break
@@ -540,7 +633,6 @@ def _es_pdf(ruta):
 
 
 def _convertir_a_cuerpo(ruta, carpeta_slug, slug):
-    """Dispatcher: elige docx o pdf según extensión."""
     if _es_pdf(ruta):
         return pdf_a_cuerpo(ruta, carpeta_slug, slug)
     return docx_a_cuerpo(ruta, carpeta_slug, slug)
@@ -551,10 +643,6 @@ def _obtener_titulo_sugerido(ruta):
         return primer_titulo_pdf(ruta)
     return primer_titulo(ruta)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  FILTROS DE ARCHIVO
-# ══════════════════════════════════════════════════════════════════════════════
 
 FILTRO_DOC_ZENITY = "Documentos | *.docx *.pdf"
 FILTRO_DOC_TK     = [("Word o PDF", "*.docx *.pdf"), ("Word", "*.docx"), ("PDF", "*.pdf")]
@@ -567,12 +655,15 @@ FILTRO_IMG_TK     = [("Imágenes", "*.jpg *.jpeg *.png *.webp")]
 # ══════════════════════════════════════════════════════════════════════════════
 
 class VentanaPreview(ctk.CTkToplevel):
-    def __init__(self, master, titulo, categoria, autor, fecha, resumen, cuerpo_html):
+    def __init__(self, master, titulo, categoria, autor, fecha, resumen, cuerpo_html,
+                 carpeta_preview=None):
         super().__init__(master)
         self.title("Previsualización del artículo")
-        self.geometry("820x700")
+        self.geometry("820x720")
         self.resizable(True, True)
         self.resultado = False
+        self._imagenes_tk = []
+        self._carpeta_preview = carpeta_preview
 
         header = ctk.CTkFrame(self, fg_color="#0C4988", corner_radius=0)
         header.pack(fill="x")
@@ -607,18 +698,19 @@ class VentanaPreview(ctk.CTkToplevel):
         sb = tk.Scrollbar(frame)
         sb.pack(side="right", fill="y")
 
-        txt = tk.Text(
+        self._txt = tk.Text(
             frame, wrap="word", yscrollcommand=sb.set,
             bg="#f4efe2", fg="#2b2620", font=("Georgia", 13),
             relief="flat", padx=28, pady=20, cursor="arrow", state="normal"
         )
-        txt.pack(fill="both", expand=True)
-        sb.config(command=txt.yview)
+        self._txt.pack(fill="both", expand=True)
+        sb.config(command=self._txt.yview)
 
+        txt = self._txt
         txt.tag_config("tag_pill",  foreground="#8e0209", font=("Arial", 10), spacing1=4)
         txt.tag_config("h1",        font=("Arial", 22, "bold"), spacing1=10, spacing3=4)
-        txt.tag_config("h2",        font=("Arial", 16, "bold"), spacing1=14, spacing3=3, foreground="#1a3fa0")
-        txt.tag_config("h3",        font=("Arial", 14, "bold"), spacing1=10, spacing3=2, foreground="#c0392b")
+        txt.tag_config("h2",        font=("Arial", 15, "bold"), spacing1=14, spacing3=3, foreground="#1a3fa0")
+        txt.tag_config("h3",        font=("Arial", 13, "bold"), spacing1=10, spacing3=2, foreground="#c0392b")
         txt.tag_config("meta",      foreground="#888888", font=("Arial", 10), spacing3=10)
         txt.tag_config("p",         font=("Georgia", 13), spacing3=8)
         txt.tag_config("resumen",   font=("Georgia", 12, "italic"), foreground="#555555", spacing3=12)
@@ -627,6 +719,8 @@ class VentanaPreview(ctk.CTkToplevel):
                        foreground="white", spacing1=4, spacing3=4)
         txt.tag_config("tabla_izq", font=("Arial", 11, "bold"), foreground="#1a3fa0", spacing1=2)
         txt.tag_config("tabla_der", font=("Georgia", 11), spacing3=6)
+        txt.tag_config("img_label", foreground="#555555", font=("Arial", 10, "italic"),
+                       spacing1=4, spacing3=8, justify="center")
 
         txt.insert("end", f"{categoria}\n", "tag_pill")
         txt.insert("end", f"{titulo}\n", "h1")
@@ -638,43 +732,53 @@ class VentanaPreview(ctk.CTkToplevel):
         self._renderizar_html(txt, cuerpo_html)
         txt.config(state="disabled")
 
+    def _insertar_imagen_preview(self, txt, ruta_archivo):
+        try:
+            from PIL import Image as PILImage, ImageTk
+            img = PILImage.open(ruta_archivo)
+            max_w = 580
+            if img.width > max_w:
+                ratio = max_w / img.width
+                img = img.resize((max_w, int(img.height * ratio)), PILImage.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self._imagenes_tk.append(photo)
+            txt.image_create("end", image=photo, padx=4, pady=8)
+            txt.insert("end", "\n")
+        except Exception as e:
+            txt.insert("end", f"[📷 Imagen no disponible]\n", "img_label")
+
     def _renderizar_html(self, txt, html):
         import re as _re
 
-        html = _re.sub(r'<figure[^>]*>.*?</figure>', '[📷 Imagen]', html, flags=_re.DOTALL)
+        partes = _re.split(r'(<figure[^>]*>.*?</figure>)', html, flags=_re.DOTALL)
 
-        # Detectar y renderizar tablas
-        def render_tabla(m):
-            contenido = m.group(0)
-            # encabezado
-            hdrs = _re.findall(r'<th[^>]*>(.*?)</th>', contenido, _re.DOTALL)
-            if hdrs:
-                hdr_text = " | ".join(_re.sub(r'<[^>]+>', '', h).strip() for h in hdrs)
-                txt.insert("end", hdr_text + "\n", "tabla_hdr")
-            # filas
-            filas = _re.findall(r'<tr>(.*?)</tr>', contenido, _re.DOTALL)
-            for fila in filas:
-                celdas = _re.findall(r'<td[^>]*>(.*?)</td>', fila, _re.DOTALL)
-                if len(celdas) >= 2:
-                    izq = _re.sub(r'<[^>]+>', '', celdas[0]).strip()
-                    der = _re.sub(r'<[^>]+>', '', celdas[1]).strip()
-                    if izq:
-                        txt.insert("end", izq + "\n", "tabla_izq")
-                    if der:
-                        txt.insert("end", der + "\n", "tabla_der")
-            return ""
-
-        partes = _re.split(r'(<div class="table-wrap">.*?</div>)', html, flags=_re.DOTALL)
         for parte in partes:
+            parte = parte.strip()
+            if not parte:
+                continue
+
+            if parte.startswith('<figure'):
+                src_match = _re.search(r'src="([^"]+)"', parte)
+                if src_match:
+                    src = src_match.group(1)
+                    ruta_local = None
+                    if self._carpeta_preview:
+                        nombre = Path(src).name
+                        candidata = self._carpeta_preview / "img_inline" / nombre
+                        if candidata.exists():
+                            ruta_local = candidata
+                    if ruta_local:
+                        self._insertar_imagen_preview(txt, ruta_local)
+                    else:
+                        txt.insert("end", "[📷 Imagen del artículo]\n", "img_label")
+                continue
+
             if parte.startswith('<div class="table-wrap">'):
-                render_tabla(_re.match(r'.*', parte, _re.DOTALL))
-                # llamar directo
-                contenido = parte
-                hdrs = _re.findall(r'<th[^>]*>(.*?)</th>', contenido, _re.DOTALL)
+                hdrs = _re.findall(r'<th[^>]*>(.*?)</th>', parte, _re.DOTALL)
                 if hdrs:
                     hdr_text = " | ".join(_re.sub(r'<[^>]+>', '', h).strip() for h in hdrs)
                     txt.insert("end", hdr_text + "\n", "tabla_hdr")
-                filas = _re.findall(r'<tr>(.*?)</tr>', contenido, _re.DOTALL)
+                filas = _re.findall(r'<tr>(.*?)</tr>', parte, _re.DOTALL)
                 for fila in filas:
                     celdas = _re.findall(r'<td[^>]*>(.*?)</td>', fila, _re.DOTALL)
                     if len(celdas) >= 2:
@@ -684,22 +788,23 @@ class VentanaPreview(ctk.CTkToplevel):
                             txt.insert("end", izq + "\n", "tabla_izq")
                         if der:
                             txt.insert("end", der + "\n", "tabla_der")
-            else:
-                bloques = parte.split("\n\n")
-                for bloque in bloques:
-                    bloque = bloque.strip()
-                    if not bloque:
-                        continue
-                    if bloque.startswith("<h2"):
-                        texto = _re.sub(r'<[^>]+>', '', bloque)
-                        txt.insert("end", texto + "\n", "h2")
-                    elif bloque.startswith("<h3"):
-                        texto = _re.sub(r'<[^>]+>', '', bloque)
-                        txt.insert("end", texto + "\n", "h3")
-                    else:
-                        texto = _re.sub(r'<[^>]+>', '', bloque)
-                        if texto:
-                            txt.insert("end", texto + "\n", "p")
+                continue
+
+            bloques = parte.split("\n\n")
+            for bloque in bloques:
+                bloque = bloque.strip()
+                if not bloque:
+                    continue
+                if bloque.startswith("<h2"):
+                    texto = _re.sub(r'<[^>]+>', '', bloque)
+                    txt.insert("end", texto + "\n", "h2")
+                elif bloque.startswith("<h3"):
+                    texto = _re.sub(r'<[^>]+>', '', bloque)
+                    txt.insert("end", texto + "\n", "h3")
+                else:
+                    texto = _re.sub(r'<[^>]+>', '', bloque)
+                    if texto:
+                        txt.insert("end", texto + "\n", "p")
 
     def _confirmar(self):
         self.resultado = True
@@ -815,8 +920,9 @@ class App(ctk.CTk):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _construir_tab_crear(self, padre):
-        self.c_ruta_doc   = None
+        self.c_ruta_doc    = None
         self.c_ruta_imagen = None
+        self._carpeta_preview_temp = None
 
         self.c_btn_doc = ctk.CTkButton(
             padre, text="📄 Elegir archivo Word (.docx) o PDF",
@@ -861,15 +967,11 @@ class App(ctk.CTk):
         self.c_lbl_estado.pack(pady=6)
 
     def _c_elegir_doc(self):
-        ruta = elegir_archivo(
-            "Elegir noticia (Word o PDF)",
-            FILTRO_DOC_ZENITY, FILTRO_DOC_TK
-        )
+        ruta = elegir_archivo("Elegir noticia (Word o PDF)", FILTRO_DOC_ZENITY, FILTRO_DOC_TK)
         if not ruta:
             return
         self.c_ruta_doc = Path(ruta)
-        ext = self.c_ruta_doc.suffix.upper()
-        self.c_lbl_doc.configure(text=f"{self.c_ruta_doc.name}  [{ext}]")
+        self.c_lbl_doc.configure(text=f"{self.c_ruta_doc.name}  [{self.c_ruta_doc.suffix.upper()}]")
         titulo_sugerido = _obtener_titulo_sugerido(self.c_ruta_doc)
         if titulo_sugerido and not self.c_entry_titulo.get():
             self.c_entry_titulo.insert(0, titulo_sugerido)
@@ -913,10 +1015,24 @@ class App(ctk.CTk):
             messagebox.showerror("Fecha inválida", "Usa el formato YYYY-MM-DD.")
             return
 
-        cuerpo_html = _convertir_a_cuerpo(self.c_ruta_doc, None, slugify(titulo))
+        import tempfile
+        carpeta_temp = Path(tempfile.mkdtemp(prefix="mjr21_preview_"))
+        self._carpeta_preview_temp = carpeta_temp
 
-        preview = VentanaPreview(self, titulo, categoria, autor, fecha, resumen, cuerpo_html)
+        slug_preview = slugify(titulo)
+        cuerpo_html  = _convertir_a_cuerpo(self.c_ruta_doc, carpeta_temp, slug_preview)
+
+        preview = VentanaPreview(
+            self, titulo, categoria, autor, fecha, resumen, cuerpo_html,
+            carpeta_preview=carpeta_temp
+        )
         self.wait_window(preview)
+
+        try:
+            shutil.rmtree(carpeta_temp)
+        except Exception:
+            pass
+        self._carpeta_preview_temp = None
 
         if preview.resultado:
             self._c_generar(titulo, categoria, autor, fecha, resumen)
@@ -986,8 +1102,7 @@ class App(ctk.CTk):
         ctk.CTkButton(padre, text="🔄 Actualizar lista", command=self._e_refrescar_lista, height=30).pack(pady=(0, 10))
 
         self.e_btn_doc = ctk.CTkButton(
-            padre, text="📄 Reemplazar Word/PDF (opcional)",
-            command=self._e_elegir_doc
+            padre, text="📄 Reemplazar Word/PDF (opcional)", command=self._e_elegir_doc
         )
         self.e_btn_doc.pack(fill="x", padx=20, pady=(0, 4))
         self.e_lbl_doc = ctk.CTkLabel(
@@ -997,8 +1112,7 @@ class App(ctk.CTk):
         self.e_lbl_doc.pack()
 
         self.e_btn_imagen = ctk.CTkButton(
-            padre, text="🖼️ Reemplazar foto de portada (opcional)",
-            command=self._e_elegir_imagen
+            padre, text="🖼️ Reemplazar foto de portada (opcional)", command=self._e_elegir_imagen
         )
         self.e_btn_imagen.pack(fill="x", padx=20, pady=(6, 4))
         self.e_lbl_imagen = ctk.CTkLabel(
@@ -1067,8 +1181,7 @@ class App(ctk.CTk):
         if not ruta:
             return
         self.e_ruta_doc = Path(ruta)
-        ext = self.e_ruta_doc.suffix.upper()
-        self.e_lbl_doc.configure(text=f"Nuevo archivo: {self.e_ruta_doc.name}  [{ext}]")
+        self.e_lbl_doc.configure(text=f"Nuevo archivo: {self.e_ruta_doc.name}  [{self.e_ruta_doc.suffix.upper()}]")
 
     def _e_elegir_imagen(self):
         ruta = elegir_archivo("Elegir nueva foto", FILTRO_IMG_ZENITY, FILTRO_IMG_TK)
