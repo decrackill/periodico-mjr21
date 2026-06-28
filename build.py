@@ -22,7 +22,6 @@ ARTICULOS_POR_PAGINA = 12
 # ── Hashes (build incremental) ─────────────────────────────────────────────
 
 def hash_carpeta(carpeta: Path) -> str:
-    """MD5 del texto + metadatos de imagen fuente. Cambia solo si el contenido cambia."""
     h = hashlib.md5()
     txt = carpeta / "articulo.txt"
     if txt.exists():
@@ -119,7 +118,6 @@ def procesar_imagen(slug: str, origen) -> str:
 
 
 def copiar_imagenes_inline(slug: str):
-    """Copia nuevos/{slug}/img_inline/ → img/articulos/{slug}/img_inline/ si existe."""
     origen = NUEVOS / slug / "img_inline"
     if not origen.exists():
         return
@@ -145,7 +143,6 @@ def limpiar_huerfanos(articulos: list, total_paginas: int):
             shutil.rmtree(carpeta)
             print(f"  Eliminada carpeta huérfana: img/articulos/{carpeta.name}")
 
-    # Eliminar páginas de paginación que ya no existen
     if PAGINA_DIR.exists():
         for carpeta in PAGINA_DIR.iterdir():
             if carpeta.is_dir():
@@ -215,20 +212,19 @@ def paginacion_html(pagina_actual: int, total_paginas: int) -> str:
 # ── Generadores ────────────────────────────────────────────────────────────
 
 def generar_pagina_home(articulos_pagina: list, pagina: int, total_paginas: int):
-    """Genera una página del home (index.html o pagina/N/index.html)."""
     plantilla = (TEMPLATES / "home.html").read_text(encoding="utf-8")
     anio = str(datetime.now().year)
 
     if pagina == 1:
         destacado = destacado_html(articulos_pagina[0]) if articulos_pagina else ""
-        tarjetas = "\n".join(tarjeta_html(a) for a in articulos_pagina[1:])
-        destino = ROOT / "index.html"
+        tarjetas  = "\n".join(tarjeta_html(a) for a in articulos_pagina[1:])
+        destino   = ROOT / "index.html"
     else:
         destacado = ""
-        tarjetas = "\n".join(tarjeta_html(a) for a in articulos_pagina)
-        carpeta = PAGINA_DIR / str(pagina)
+        tarjetas  = "\n".join(tarjeta_html(a) for a in articulos_pagina)
+        carpeta   = PAGINA_DIR / str(pagina)
         carpeta.mkdir(parents=True, exist_ok=True)
-        destino = carpeta / "index.html"
+        destino   = carpeta / "index.html"
 
     html = plantilla.replace("{{DESTACADO}}", destacado)
     html = html.replace("{{TARJETAS}}", tarjetas)
@@ -237,16 +233,13 @@ def generar_pagina_home(articulos_pagina: list, pagina: int, total_paginas: int)
     destino.write_text(html, encoding="utf-8")
 
 
-def generar_home(articulos: list):
-    """Divide artículos en páginas y genera todos los index."""
+def generar_home(articulos: list) -> int:
     total = len(articulos)
-    total_paginas = max(1, -(-total // ARTICULOS_POR_PAGINA))  # ceil division
-
+    total_paginas = max(1, -(-total // ARTICULOS_POR_PAGINA))
     for num_pagina in range(1, total_paginas + 1):
         inicio = (num_pagina - 1) * ARTICULOS_POR_PAGINA
-        fin = inicio + ARTICULOS_POR_PAGINA
+        fin    = inicio + ARTICULOS_POR_PAGINA
         generar_pagina_home(articulos[inicio:fin], num_pagina, total_paginas)
-
     print(f"  Home: {total_paginas} página(s) generada(s) ({ARTICULOS_POR_PAGINA} artículos/página)")
     return total_paginas
 
@@ -274,33 +267,30 @@ def guardar_json(articulos: list):
 def main():
     articulos = cargar_articulos()
     hashes_previos = cargar_hashes()
-    hashes_nuevos = {}
+    hashes_nuevos  = {}
     imagenes_procesadas = 0
-    imagenes_saltadas = 0
+    imagenes_saltadas   = 0
 
     print("Procesando imágenes...")
     for art in articulos:
-        slug = art["slug"]
+        slug    = art["slug"]
         carpeta = NUEVOS / slug
         hash_actual = hash_carpeta(carpeta)
         hashes_nuevos[slug] = hash_actual
 
         portada_existe = (IMG_ARTICULOS / slug / "portada.webp").exists()
-        sin_cambios = (hashes_previos.get(slug) == hash_actual) and portada_existe
+        sin_cambios    = (hashes_previos.get(slug) == hash_actual) and portada_existe
+
+        # Sacar _imagen_origen del dict antes de cualquier rama
+        imagen_origen = art.pop("_imagen_origen", None)
 
         if sin_cambios:
-            # Skip imagen — usar ruta ya existente
             art["imagen"] = f"/img/articulos/{slug}/portada.webp"
             imagenes_saltadas += 1
         else:
-            art["imagen"] = procesar_imagen(slug, art.pop("_imagen_origen"))
+            art["imagen"] = procesar_imagen(slug, imagen_origen)
             copiar_imagenes_inline(slug)
-            if "_imagen_origen" in art:
-                art.pop("_imagen_origen", None)
             imagenes_procesadas += 1
-
-        # Asegurar que _imagen_origen no quede en el dict
-        art.pop("_imagen_origen", None)
 
     if imagenes_saltadas:
         print(f"  Saltadas: {imagenes_saltadas} imagen(es) sin cambios")

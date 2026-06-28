@@ -1,6 +1,6 @@
 """
 Generador de Noticias — MJR-21
-Lee un Word (.docx) con negrillas/cursivas/párrafos/tablas/imágenes y genera
+Lee un Word (.docx) o PDF con negrillas/cursivas/párrafos/tablas/imágenes y genera
 la carpeta nuevos/{slug}/ lista, luego corre build.py.
 Pestañas: Crear noticia | Editar noticia | Eliminar / deshacer
 """
@@ -19,6 +19,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from docx import Document
 from docx.oxml.ns import qn
+import fitz  # pymupdf
 
 ROOT = Path(__file__).parent
 NUEVOS = ROOT / "nuevos"
@@ -42,7 +43,6 @@ def slugify(texto):
 
 
 def validar_fecha(texto):
-    """Devuelve True si el texto es una fecha YYYY-MM-DD válida."""
     try:
         datetime.strptime(texto.strip(), "%Y-%m-%d")
         return True
@@ -210,6 +210,290 @@ def primer_titulo(ruta_docx):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  CONVERSIÓN PDF → HTML
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _color_rgb(c):
+    return ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)
+
+
+def _similar_color(c1, c2, tol=35):
+    return all(abs(a - b) <= tol for a, b in zip(c1, c2))
+
+
+# Colores de referencia del PDF MJR-21
+_AZUL     = (26, 63, 160)   # encabezados sección, celda izq tabla
+_ROJO     = (192, 57, 43)   # subsección, acento
+_BLANCO   = (255, 255, 255) # texto sobre fondo azul (header tabla)
+_GRIS     = (136, 136, 136) # pie de página
+_OSCURO   = (30, 30, 46)    # texto cuerpo
+
+
+def _escape(t):
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def pdf_a_cuerpo(ruta_pdf, carpeta_slug, slug):
+    """
+    Convierte un PDF a HTML estructurado respetando:
+    - Encabezados por tamaño y color
+    - Tablas de dos columnas (disposición | contenido)
+    - Párrafos normales
+    - Imágenes inline (desde página 2 en adelante para saltar portada)
+    """
+    doc = fitz.open(str(ruta_pdf))
+    bloques_html = []
+    carpeta_img = None
+    img_counter = 0
+
+    if carpeta_slug:
+        carpeta_img = carpeta_slug / "img_inline"
+        carpeta_img.mkdir(parents=True, exist_ok=True)
+
+    for num_pag, pagina in enumerate(doc):
+        # ── Extraer imágenes (saltamos portada pág 0) ──────────────────────
+        if carpeta_img and num_pag > 0:
+            for img_info in pagina.get_images(full=True):
+                xref = img_info[0]
+                base = doc.extract_image(xref)
+                if base["width"] < 80 or base["height"] < 80:
+                    continue  # skip iconos pequeños
+                ext = base["ext"]
+                nombre = f"pdf_img_{img_counter}.{ext}"
+                destino = carpeta_img / nombre
+                with open(destino, "wb") as f:
+                    f.write(base["image"])
+                ruta_pub = f"/img/articulos/{slug}/img_inline/{nombre}"
+                bloques_html.append(
+                    f'<figure class="article-inline-img">'
+                    f'<img src="{ruta_pub}" alt="Imagen" loading="lazy">'
+                    f'</figure>'
+                )
+                img_counter += 1
+
+        # ── Extraer spans con posición ──────────────────────────────────────
+        raw_bloques = pagina.get_text("rawdict", flags=0)["blocks"]
+        spans_pag = []  # (y, x, size, bold, italic, rgb, text)
+
+        for b in raw_bloques:
+            if b["type"] != 0:
+                continue
+            for linea in b["lines"]:
+                y = linea["bbox"][1]
+                x = linea["bbox"][0]
+                for span in linea["spans"]:
+                    chars = span.get("chars", [])
+                    text = "".join(c["c"] for c in chars).strip()
+                    if not text:
+                        continue
+                    rgb = _color_rgb(span["color"])
+                    sz  = span["size"]
+                    fl  = span["flags"]
+                    bold   = bool(fl & 2**4)
+                    italic = bool(fl & 2**1)
+                    spans_pag.append((y, x, sz, bold, italic, rgb, text))
+
+        # ── Agrupar en líneas (misma Y ± 4px) ──────────────────────────────
+        lineas_pag = []
+        for item in sorted(spans_pag, key=lambda s: (round(s[0] / 4), s[1])):
+            y = item[0]
+            if lineas_pag and abs(y - lineas_pag[-1][0][0]) < 4:
+                lineas_pag[-1].append(item)
+            else:
+                lineas_pag.append([item])
+
+        # ── Detectar umbral X de columna derecha de tabla ──────────────────
+        # Las líneas oscuras de cuerpo de tabla tienen X > ~180
+        xs_cuerpo = [grupo[0][1] for grupo in lineas_pag
+                     if _similar_color(grupo[0][5], _OSCURO)
+                     and grupo[0][1] > 150]
+        umbral_col_derecha = min(xs_cuerpo) if xs_cuerpo else 200
+
+        # ── Estado de tabla ─────────────────────────────────────────────────
+        en_tabla      = False
+        celda_izq_buf = []   # líneas acumuladas de columna izquierda
+        celda_der_buf = []   # líneas acumuladas de columna derecha
+        filas_tabla   = []   # filas HTML completas
+
+        def _volcar_celda_pendiente():
+            """Cierra fila de tabla cuando cambia la celda izquierda."""
+            if celda_izq_buf or celda_der_buf:
+                izq = " ".join(celda_izq_buf)
+                der = " ".join(celda_der_buf)
+                izq_html = _escape(izq)
+                der_html = _escape(der)
+                filas_tabla.append(
+                    f"<tr>"
+                    f'<td><strong style="color:#1a3fa0">{izq_html}</strong></td>'
+                    f"<td>{der_html}</td>"
+                    f"</tr>"
+                )
+                celda_izq_buf.clear()
+                celda_der_buf.clear()
+
+        def _volcar_tabla():
+            nonlocal en_tabla
+            _volcar_celda_pendiente()
+            if filas_tabla:
+                header = (
+                    "<tr>"
+                    '<th style="background:#1a3fa0;color:#fff">DISPOSICIÓN CONSTITUCIONAL</th>'
+                    '<th style="background:#1a3fa0;color:#fff">CONTENIDO DE LA PROPUESTA</th>'
+                    "</tr>"
+                )
+                bloques_html.append(
+                    f'<div class="table-wrap"><table>{header}{"".join(filas_tabla)}</table></div>'
+                )
+                filas_tabla.clear()
+            en_tabla = False
+
+        for grupo in lineas_pag:
+            y0   = grupo[0][0]
+            x0   = grupo[0][1]
+            sz0  = grupo[0][2]
+            bold0 = grupo[0][3]
+            rgb0 = grupo[0][5]
+
+            # Texto completo de la línea
+            texto_linea = " ".join(item[6] for item in grupo).strip()
+            if not texto_linea:
+                continue
+
+            # ── Ignorar encabezado/pie de página ───────────────────────────
+            if _similar_color(rgb0, _GRIS):
+                continue
+            # Header de la organización (azul pequeño, primera línea de página)
+            if _similar_color(rgb0, _AZUL) and sz0 <= 10 and "MOVIMIENTO" in texto_linea:
+                continue
+            # Número de página
+            if re.match(r'^Pág\.\s*\d+', texto_linea):
+                continue
+
+            # ── Texto blanco = encabezado de tabla (DISPOSICIÓN / CONTENIDO) ─
+            if _similar_color(rgb0, _BLANCO):
+                # Inicio de tabla: volcamos lo anterior si había párrafos
+                en_tabla = True
+                continue
+
+            # ── Encabezado principal (azul grande ≥ 14pt) ──────────────────
+            if _similar_color(rgb0, _AZUL) and sz0 >= 13:
+                if en_tabla:
+                    _volcar_tabla()
+                txt = _escape(texto_linea)
+                bloques_html.append(
+                    f'<h2 style="color:#1a3fa0;border-left:4px solid #1a3fa0;'
+                    f'padding-left:0.6em;margin:1.5em 0 0.4em">{txt}</h2>'
+                )
+                continue
+
+            # ── Subsección (rojo/naranja ≥ 11pt) ───────────────────────────
+            if (_similar_color(rgb0, _ROJO) or _similar_color(rgb0, (192,57,43), 40)) and sz0 >= 10:
+                if en_tabla:
+                    _volcar_tabla()
+                txt = _escape(texto_linea)
+                bloques_html.append(
+                    f'<h3 style="color:#c0392b;margin:1.2em 0 0.3em">{txt}</h3>'
+                )
+                continue
+
+            # ── Contenido dentro de tabla ───────────────────────────────────
+            if en_tabla:
+                # Celda izquierda: azul bold, x < umbral
+                if _similar_color(rgb0, _AZUL) and bold0 and x0 < umbral_col_derecha - 20:
+                    # Nueva celda izquierda: volcar fila anterior
+                    if celda_der_buf:
+                        _volcar_celda_pendiente()
+                    celda_izq_buf.append(texto_linea)
+                # Celda derecha: texto oscuro, x >= umbral O continuación
+                elif _similar_color(rgb0, _OSCURO) and not bold0:
+                    celda_der_buf.append(texto_linea)
+                # Azul bold a la derecha (título celda der a veces)
+                elif _similar_color(rgb0, _AZUL) and bold0 and x0 >= umbral_col_derecha - 20:
+                    celda_der_buf.append(texto_linea)
+                # Parágrafo azul normal entre tablas
+                elif _similar_color(rgb0, _AZUL) and not bold0:
+                    if en_tabla:
+                        _volcar_tabla()
+                    txt = _escape(texto_linea)
+                    bloques_html.append(f"<p><em>{txt}</em></p>")
+                continue
+
+            # ── Párrafo normal ──────────────────────────────────────────────
+            if _similar_color(rgb0, _OSCURO) or (not _similar_color(rgb0, _AZUL)
+                                                   and not _similar_color(rgb0, _ROJO)):
+                # Parágrafo con posible bold/italic
+                partes = []
+                for item in grupo:
+                    t = _escape(item[6])
+                    if item[3] and item[4]:
+                        t = f"<strong><em>{t}</em></strong>"
+                    elif item[3]:
+                        t = f"<strong>{t}</strong>"
+                    elif item[4]:
+                        t = f"<em>{t}</em>"
+                    partes.append(t)
+                bloques_html.append(f"<p>{''.join(partes)}</p>")
+                continue
+
+            # ── Texto azul no clasificado (parágrafo azul) ─────────────────
+            if _similar_color(rgb0, _AZUL):
+                txt = _escape(texto_linea)
+                bloques_html.append(f'<p style="color:#1a3fa0"><em>{txt}</em></p>')
+
+        # Cerrar tabla abierta al final de la página
+        if en_tabla:
+            _volcar_tabla()
+
+    doc.close()
+
+    # ── Post-proceso: fusionar <p> consecutivos del mismo bloque ───────────
+    resultado = []
+    buf_p = []
+
+    def volcar_p():
+        if buf_p:
+            resultado.append("<p>" + " ".join(buf_p) + "</p>")
+            buf_p.clear()
+
+    for bloque in bloques_html:
+        if bloque.startswith("<p>") and not bloque.startswith('<p style'):
+            # Extraer contenido
+            inner = re.sub(r'^<p>(.*)</p>$', r'\1', bloque, flags=re.DOTALL)
+            buf_p.append(inner)
+        else:
+            volcar_p()
+            resultado.append(bloque)
+    volcar_p()
+
+    return "\n\n".join(resultado)
+
+
+def primer_titulo_pdf(ruta_pdf):
+    """Extrae el título más prominente del PDF (mayor tamaño de fuente)."""
+    doc = fitz.open(str(ruta_pdf))
+    candidatos = []
+    for pagina in doc:
+        for b in pagina.get_text("rawdict", flags=0)["blocks"]:
+            if b["type"] != 0:
+                continue
+            for linea in b["lines"]:
+                for span in linea["spans"]:
+                    chars = span.get("chars", [])
+                    text = "".join(c["c"] for c in chars).strip()
+                    if text and span["size"] >= 12:
+                        rgb = _color_rgb(span["color"])
+                        if not _similar_color(rgb, _GRIS) and not _similar_color(rgb, _BLANCO):
+                            candidatos.append((span["size"], text))
+        if candidatos:
+            break
+    doc.close()
+    if candidatos:
+        candidatos.sort(key=lambda x: -x[0])
+        return candidatos[0][1]
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  UTILIDADES DE ARTÍCULOS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -232,7 +516,6 @@ def listar_articulos_existentes():
 
 
 def leer_metadata_articulo(slug):
-    """Lee el articulo.txt de un slug y devuelve un dict con los campos."""
     archivo = NUEVOS / slug / "articulo.txt"
     if not archivo.exists():
         return {}
@@ -252,35 +535,36 @@ def eliminar_articulo(slug):
             shutil.rmtree(carpeta)
 
 
+def _es_pdf(ruta):
+    return ruta is not None and Path(ruta).suffix.lower() == ".pdf"
+
+
+def _convertir_a_cuerpo(ruta, carpeta_slug, slug):
+    """Dispatcher: elige docx o pdf según extensión."""
+    if _es_pdf(ruta):
+        return pdf_a_cuerpo(ruta, carpeta_slug, slug)
+    return docx_a_cuerpo(ruta, carpeta_slug, slug)
+
+
+def _obtener_titulo_sugerido(ruta):
+    if _es_pdf(ruta):
+        return primer_titulo_pdf(ruta)
+    return primer_titulo(ruta)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FILTROS DE ARCHIVO
+# ══════════════════════════════════════════════════════════════════════════════
+
+FILTRO_DOC_ZENITY = "Documentos | *.docx *.pdf"
+FILTRO_DOC_TK     = [("Word o PDF", "*.docx *.pdf"), ("Word", "*.docx"), ("PDF", "*.pdf")]
+FILTRO_IMG_ZENITY = "Imágenes | *.jpg *.jpeg *.png *.webp"
+FILTRO_IMG_TK     = [("Imágenes", "*.jpg *.jpeg *.png *.webp")]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  VENTANA DE PREVISUALIZACIÓN
 # ══════════════════════════════════════════════════════════════════════════════
-
-PREVIEW_CSS = """
-<style>
-* { margin:0; padding:0; box-sizing:border-box; }
-body { font-family: Georgia, serif; background:#f4efe2; color:#2b2620;
-       line-height:1.65; font-size:16px; padding: 2rem; }
-h1 { font-size:1.8rem; margin-bottom:.5rem; font-family: sans-serif; }
-h2 { font-size:1.3rem; margin:1.5rem 0 .4rem; font-family: sans-serif; }
-h3 { font-size:1.1rem; margin:1.2rem 0 .3rem; font-family: sans-serif; }
-p  { margin-bottom:1rem; }
-.meta { color:#888; font-size:.85rem; margin-bottom:1.5rem; font-family:sans-serif; }
-.tag { display:inline-block; background:#c0030e22; color:#8e0209;
-       font-size:.75rem; padding:.2rem .7rem; border-radius:20px;
-       font-family:sans-serif; margin-bottom:.8rem; }
-img { max-width:100%; border-radius:8px; margin:1rem auto; display:block; }
-figure { margin:1.5rem 0; text-align:center; }
-table { width:100%; border-collapse:collapse; margin:1.2rem 0; font-size:.9rem; }
-th { background:#0c4988; color:#fff; padding:.5rem .8rem; text-align:left; font-family:sans-serif; }
-td { padding:.5rem .8rem; border-top:1px solid #ddd; }
-tr:nth-child(even) td { background:rgba(0,0,0,.03); }
-.table-wrap { overflow-x:auto; }
-blockquote { border-left:4px solid #fab902; padding:.5rem 1rem;
-             margin:1rem 0; color:#555; font-style:italic; }
-</style>
-"""
-
 
 class VentanaPreview(ctk.CTkToplevel):
     def __init__(self, master, titulo, categoria, autor, fecha, resumen, cuerpo_html):
@@ -288,9 +572,8 @@ class VentanaPreview(ctk.CTkToplevel):
         self.title("Previsualización del artículo")
         self.geometry("820x700")
         self.resizable(True, True)
-        self.resultado = False  # True = confirmar, False = cancelar
+        self.resultado = False
 
-        # Header
         header = ctk.CTkFrame(self, fg_color="#0C4988", corner_radius=0)
         header.pack(fill="x")
         ctk.CTkLabel(
@@ -298,10 +581,8 @@ class VentanaPreview(ctk.CTkToplevel):
             font=("Arial", 13, "bold"), text_color="white"
         ).pack(side="left", padx=16, pady=10)
 
-        # Área de previsualización (HTML renderizado con tk.Text + tags)
         self._construir_vista(titulo, categoria, autor, fecha, resumen, cuerpo_html)
 
-        # Botones
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.pack(fill="x", padx=20, pady=12)
         ctk.CTkButton(
@@ -321,7 +602,7 @@ class VentanaPreview(ctk.CTkToplevel):
         import tkinter as tk
 
         frame = ctk.CTkFrame(self, fg_color="#f4efe2", corner_radius=0)
-        frame.pack(fill="both", expand=True, padx=0, pady=0)
+        frame.pack(fill="both", expand=True)
 
         sb = tk.Scrollbar(frame)
         sb.pack(side="right", fill="y")
@@ -329,23 +610,24 @@ class VentanaPreview(ctk.CTkToplevel):
         txt = tk.Text(
             frame, wrap="word", yscrollcommand=sb.set,
             bg="#f4efe2", fg="#2b2620", font=("Georgia", 13),
-            relief="flat", padx=28, pady=20, cursor="arrow",
-            state="normal"
+            relief="flat", padx=28, pady=20, cursor="arrow", state="normal"
         )
         txt.pack(fill="both", expand=True)
         sb.config(command=txt.yview)
 
-        # Tags de estilo
-        txt.tag_config("tag_pill", foreground="#8e0209", font=("Arial", 10), spacing1=4)
-        txt.tag_config("h1",  font=("Arial", 22, "bold"), spacing1=10, spacing3=4)
-        txt.tag_config("h2",  font=("Arial", 16, "bold"), spacing1=14, spacing3=3)
-        txt.tag_config("h3",  font=("Arial", 14, "bold"), spacing1=10, spacing3=2)
-        txt.tag_config("meta", foreground="#888888", font=("Arial", 10), spacing3=10)
-        txt.tag_config("p",   font=("Georgia", 13), spacing3=8)
-        txt.tag_config("resumen", font=("Georgia", 12, "italic"), foreground="#555555", spacing3=12)
-        txt.tag_config("sep", font=("Arial", 6), spacing1=6, spacing3=6)
+        txt.tag_config("tag_pill",  foreground="#8e0209", font=("Arial", 10), spacing1=4)
+        txt.tag_config("h1",        font=("Arial", 22, "bold"), spacing1=10, spacing3=4)
+        txt.tag_config("h2",        font=("Arial", 16, "bold"), spacing1=14, spacing3=3, foreground="#1a3fa0")
+        txt.tag_config("h3",        font=("Arial", 14, "bold"), spacing1=10, spacing3=2, foreground="#c0392b")
+        txt.tag_config("meta",      foreground="#888888", font=("Arial", 10), spacing3=10)
+        txt.tag_config("p",         font=("Georgia", 13), spacing3=8)
+        txt.tag_config("resumen",   font=("Georgia", 12, "italic"), foreground="#555555", spacing3=12)
+        txt.tag_config("sep",       font=("Arial", 6), spacing1=6, spacing3=6)
+        txt.tag_config("tabla_hdr", font=("Arial", 10, "bold"), background="#1a3fa0",
+                       foreground="white", spacing1=4, spacing3=4)
+        txt.tag_config("tabla_izq", font=("Arial", 11, "bold"), foreground="#1a3fa0", spacing1=2)
+        txt.tag_config("tabla_der", font=("Georgia", 11), spacing3=6)
 
-        # Contenido
         txt.insert("end", f"{categoria}\n", "tag_pill")
         txt.insert("end", f"{titulo}\n", "h1")
         txt.insert("end", f"{autor}  ·  {fecha}\n", "meta")
@@ -353,43 +635,71 @@ class VentanaPreview(ctk.CTkToplevel):
             txt.insert("end", f"{resumen}\n", "resumen")
         txt.insert("end", "─" * 60 + "\n", "sep")
 
-        # Parsear cuerpo HTML básico para mostrarlo legible
         self._renderizar_html(txt, cuerpo_html)
-
         txt.config(state="disabled")
 
     def _renderizar_html(self, txt, html):
-        """Convierte el HTML del cuerpo a texto con tags de estilo en tk.Text."""
         import re as _re
 
-        # Eliminar figure/img (no se pueden mostrar fácilmente en tk.Text)
-        html = _re.sub(r'<figure[^>]*>.*?</figure>', '[📷 Imagen del Word]', html, flags=_re.DOTALL)
+        html = _re.sub(r'<figure[^>]*>.*?</figure>', '[📷 Imagen]', html, flags=_re.DOTALL)
 
-        # Tabla simplificada
-        def reemplazar_tabla(m):
+        # Detectar y renderizar tablas
+        def render_tabla(m):
             contenido = m.group(0)
-            celdas = _re.findall(r'<t[hd][^>]*>(.*?)</t[hd]>', contenido, _re.DOTALL)
-            celdas_limpias = [_re.sub(r'<[^>]+>', '', c).strip() for c in celdas]
-            return " | ".join(celdas_limpias)
+            # encabezado
+            hdrs = _re.findall(r'<th[^>]*>(.*?)</th>', contenido, _re.DOTALL)
+            if hdrs:
+                hdr_text = " | ".join(_re.sub(r'<[^>]+>', '', h).strip() for h in hdrs)
+                txt.insert("end", hdr_text + "\n", "tabla_hdr")
+            # filas
+            filas = _re.findall(r'<tr>(.*?)</tr>', contenido, _re.DOTALL)
+            for fila in filas:
+                celdas = _re.findall(r'<td[^>]*>(.*?)</td>', fila, _re.DOTALL)
+                if len(celdas) >= 2:
+                    izq = _re.sub(r'<[^>]+>', '', celdas[0]).strip()
+                    der = _re.sub(r'<[^>]+>', '', celdas[1]).strip()
+                    if izq:
+                        txt.insert("end", izq + "\n", "tabla_izq")
+                    if der:
+                        txt.insert("end", der + "\n", "tabla_der")
+            return ""
 
-        html = _re.sub(r'<div class="table-wrap">.*?</div>', reemplazar_tabla, html, flags=_re.DOTALL)
-
-        # Procesar bloque a bloque
-        bloques = html.split("\n\n")
-        for bloque in bloques:
-            bloque = bloque.strip()
-            if not bloque:
-                continue
-            if bloque.startswith("<h2>"):
-                texto = _re.sub(r'<[^>]+>', '', bloque)
-                txt.insert("end", texto + "\n", "h2")
-            elif bloque.startswith("<h3>"):
-                texto = _re.sub(r'<[^>]+>', '', bloque)
-                txt.insert("end", texto + "\n", "h3")
+        partes = _re.split(r'(<div class="table-wrap">.*?</div>)', html, flags=_re.DOTALL)
+        for parte in partes:
+            if parte.startswith('<div class="table-wrap">'):
+                render_tabla(_re.match(r'.*', parte, _re.DOTALL))
+                # llamar directo
+                contenido = parte
+                hdrs = _re.findall(r'<th[^>]*>(.*?)</th>', contenido, _re.DOTALL)
+                if hdrs:
+                    hdr_text = " | ".join(_re.sub(r'<[^>]+>', '', h).strip() for h in hdrs)
+                    txt.insert("end", hdr_text + "\n", "tabla_hdr")
+                filas = _re.findall(r'<tr>(.*?)</tr>', contenido, _re.DOTALL)
+                for fila in filas:
+                    celdas = _re.findall(r'<td[^>]*>(.*?)</td>', fila, _re.DOTALL)
+                    if len(celdas) >= 2:
+                        izq = _re.sub(r'<[^>]+>', '', celdas[0]).strip()
+                        der = _re.sub(r'<[^>]+>', '', celdas[1]).strip()
+                        if izq:
+                            txt.insert("end", izq + "\n", "tabla_izq")
+                        if der:
+                            txt.insert("end", der + "\n", "tabla_der")
             else:
-                texto = _re.sub(r'<[^>]+>', '', bloque)
-                if texto:
-                    txt.insert("end", texto + "\n", "p")
+                bloques = parte.split("\n\n")
+                for bloque in bloques:
+                    bloque = bloque.strip()
+                    if not bloque:
+                        continue
+                    if bloque.startswith("<h2"):
+                        texto = _re.sub(r'<[^>]+>', '', bloque)
+                        txt.insert("end", texto + "\n", "h2")
+                    elif bloque.startswith("<h3"):
+                        texto = _re.sub(r'<[^>]+>', '', bloque)
+                        txt.insert("end", texto + "\n", "h3")
+                    else:
+                        texto = _re.sub(r'<[^>]+>', '', bloque)
+                        if texto:
+                            txt.insert("end", texto + "\n", "p")
 
     def _confirmar(self):
         self.resultado = True
@@ -403,7 +713,7 @@ class VentanaPreview(ctk.CTkToplevel):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  VENTANA DE LOG (build en tiempo real)
+#  VENTANA DE LOG
 # ══════════════════════════════════════════════════════════════════════════════
 
 class VentanaLog(ctk.CTkToplevel):
@@ -433,7 +743,7 @@ class VentanaLog(ctk.CTkToplevel):
         self._txt.pack(fill="both", expand=True)
 
         self.grab_set()
-        self.protocol("WM_DELETE_WINDOW", lambda: None)  # no cerrar manualmente
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
 
     def agregar(self, linea):
         self._txt.configure(state="normal")
@@ -445,28 +755,21 @@ class VentanaLog(ctk.CTkToplevel):
         self.barra.stop()
         self.barra.configure(mode="determinate")
         self.barra.set(1.0)
-        if exito:
-            self.barra.configure(progress_color="#0B7439")
-        else:
-            self.barra.configure(progress_color="#8E0209")
+        self.barra.configure(progress_color="#0B7439" if exito else "#8E0209")
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         ctk.CTkButton(self, text="Cerrar", command=self.destroy, height=34).pack(pady=(0, 10))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FUNCIÓN: correr build.py con log en tiempo real
+#  BUILD
 # ══════════════════════════════════════════════════════════════════════════════
 
 def correr_build_con_log(ventana_log, callback_fin):
-    """Corre build.py en un hilo separado, manda output línea a línea al log."""
     def _hilo():
         proc = subprocess.Popen(
-            ["python3", "build.py"],
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            ["python3", "build.py"], cwd=ROOT,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
         )
         for linea in proc.stdout:
             ventana_log.after(0, ventana_log.agregar, linea)
@@ -476,13 +779,6 @@ def correr_build_con_log(ventana_log, callback_fin):
         ventana_log.after(0, callback_fin, exito, proc.returncode)
 
     threading.Thread(target=_hilo, daemon=True).start()
-
-
-def correr_build_silencioso():
-    """Corre build.py sin ventana, devuelve CompletedProcess."""
-    return subprocess.run(
-        ["python3", "build.py"], cwd=ROOT, capture_output=True, text=True
-    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -509,32 +805,31 @@ class App(ctk.CTk):
         self._construir_tab_editar(self.tabs.tab("Editar noticia"))
         self._construir_tab_eliminar(self.tabs.tab("Eliminar / deshacer"))
 
-    # ── helpers compartidos ───────────────────────────────────────────────────
-
     def _campo(self, padre, placeholder, pady=5):
         entry = ctk.CTkEntry(padre, placeholder_text=placeholder, height=38)
         entry.pack(pady=pady, fill="x", padx=20)
         return entry
 
-    def _seccion(self, padre, texto):
-        ctk.CTkLabel(padre, text=texto, text_color="gray", font=("Arial", 11)).pack(
-            anchor="w", padx=22, pady=(8, 0)
-        )
-
     # ══════════════════════════════════════════════════════════════════════════
-    #  PESTAÑA: CREAR NOTICIA
+    #  TAB CREAR
     # ══════════════════════════════════════════════════════════════════════════
 
     def _construir_tab_crear(self, padre):
-        self.c_ruta_docx   = None
+        self.c_ruta_doc   = None
         self.c_ruta_imagen = None
 
-        self.c_btn_docx = ctk.CTkButton(padre, text="📄 Elegir archivo Word (.docx)", command=self._c_elegir_docx)
-        self.c_btn_docx.pack(pady=(14, 4), fill="x", padx=20)
-        self.c_lbl_docx = ctk.CTkLabel(padre, text="Ningún archivo elegido", text_color="gray")
-        self.c_lbl_docx.pack()
+        self.c_btn_doc = ctk.CTkButton(
+            padre, text="📄 Elegir archivo Word (.docx) o PDF",
+            command=self._c_elegir_doc
+        )
+        self.c_btn_doc.pack(pady=(14, 4), fill="x", padx=20)
+        self.c_lbl_doc = ctk.CTkLabel(padre, text="Ningún archivo elegido", text_color="gray")
+        self.c_lbl_doc.pack()
 
-        self.c_btn_imagen = ctk.CTkButton(padre, text="🖼️ Elegir foto de portada", command=self._c_elegir_imagen)
+        self.c_btn_imagen = ctk.CTkButton(
+            padre, text="🖼️ Elegir foto de portada",
+            command=self._c_elegir_imagen
+        )
         self.c_btn_imagen.pack(pady=(8, 4), fill="x", padx=20)
         self.c_lbl_imagen = ctk.CTkLabel(padre, text="Ninguna foto elegida", text_color="gray")
         self.c_lbl_imagen.pack()
@@ -552,7 +847,7 @@ class App(ctk.CTk):
         self.c_lbl_fecha_error.pack()
 
         self.c_entry_titulo.bind("<KeyRelease>", self._c_actualizar_slug)
-        self.c_entry_fecha.bind("<KeyRelease>", self._c_validar_fecha)
+        self.c_entry_fecha.bind("<KeyRelease>",  self._c_validar_fecha)
 
         self.c_btn_previsualizar = ctk.CTkButton(
             padre, text="👁  Previsualizar antes de publicar",
@@ -565,19 +860,23 @@ class App(ctk.CTk):
         self.c_lbl_estado = ctk.CTkLabel(padre, text="", text_color="green", wraplength=540)
         self.c_lbl_estado.pack(pady=6)
 
-    def _c_elegir_docx(self):
-        ruta = elegir_archivo("Elegir noticia en Word", "Documentos Word | *.docx", [("Documentos Word", "*.docx")])
+    def _c_elegir_doc(self):
+        ruta = elegir_archivo(
+            "Elegir noticia (Word o PDF)",
+            FILTRO_DOC_ZENITY, FILTRO_DOC_TK
+        )
         if not ruta:
             return
-        self.c_ruta_docx = Path(ruta)
-        self.c_lbl_docx.configure(text=self.c_ruta_docx.name)
-        titulo_sugerido = primer_titulo(self.c_ruta_docx)
+        self.c_ruta_doc = Path(ruta)
+        ext = self.c_ruta_doc.suffix.upper()
+        self.c_lbl_doc.configure(text=f"{self.c_ruta_doc.name}  [{ext}]")
+        titulo_sugerido = _obtener_titulo_sugerido(self.c_ruta_doc)
         if titulo_sugerido and not self.c_entry_titulo.get():
             self.c_entry_titulo.insert(0, titulo_sugerido)
         self._c_actualizar_slug()
 
     def _c_elegir_imagen(self):
-        ruta = elegir_archivo("Elegir foto de portada", "Imágenes | *.jpg *.jpeg *.png *.webp", [("Imágenes", "*.jpg *.jpeg *.png *.webp")])
+        ruta = elegir_archivo("Elegir foto de portada", FILTRO_IMG_ZENITY, FILTRO_IMG_TK)
         if not ruta:
             return
         self.c_ruta_imagen = Path(ruta)
@@ -592,15 +891,14 @@ class App(ctk.CTk):
     def _c_validar_fecha(self, *_):
         texto = self.c_entry_fecha.get().strip()
         if texto and not validar_fecha(texto):
-            self.c_lbl_fecha_error.configure(text="⚠ Formato inválido. Usa YYYY-MM-DD (ej. 2026-06-28)")
+            self.c_lbl_fecha_error.configure(text="⚠ Formato inválido. Usa YYYY-MM-DD")
         else:
             self.c_lbl_fecha_error.configure(text="")
         self._c_actualizar_slug()
 
     def _c_previsualizar(self):
-        """Valida, genera el HTML en memoria y abre la ventana de preview."""
-        if not self.c_ruta_docx:
-            messagebox.showerror("Falta el Word", "Elige primero el archivo .docx.")
+        if not self.c_ruta_doc:
+            messagebox.showerror("Falta el documento", "Elige primero un archivo .docx o .pdf.")
             return
         titulo    = self.c_entry_titulo.get().strip()
         categoria = self.c_entry_categoria.get().strip()
@@ -612,11 +910,10 @@ class App(ctk.CTk):
             messagebox.showerror("Faltan datos", "Completa título, categoría, autor y fecha.")
             return
         if not validar_fecha(fecha):
-            messagebox.showerror("Fecha inválida", "Usa el formato YYYY-MM-DD (ej. 2026-06-28).")
+            messagebox.showerror("Fecha inválida", "Usa el formato YYYY-MM-DD.")
             return
 
-        # Generar HTML sin carpeta real (solo para preview, sin extraer imágenes)
-        cuerpo_html = docx_a_cuerpo(self.c_ruta_docx, None, slugify(titulo))
+        cuerpo_html = _convertir_a_cuerpo(self.c_ruta_doc, None, slugify(titulo))
 
         preview = VentanaPreview(self, titulo, categoria, autor, fecha, resumen, cuerpo_html)
         self.wait_window(preview)
@@ -633,7 +930,7 @@ class App(ctk.CTk):
                 return
 
         carpeta.mkdir(parents=True, exist_ok=True)
-        cuerpo_html = docx_a_cuerpo(self.c_ruta_docx, carpeta, slug)
+        cuerpo_html = _convertir_a_cuerpo(self.c_ruta_doc, carpeta, slug)
 
         contenido = (
             f"TITULO: {titulo}\n"
@@ -671,31 +968,43 @@ class App(ctk.CTk):
         correr_build_con_log(log, al_terminar)
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  PESTAÑA: EDITAR NOTICIA
+    #  TAB EDITAR
     # ══════════════════════════════════════════════════════════════════════════
 
     def _construir_tab_editar(self, padre):
-        self.e_slug_actual  = None
-        self.e_ruta_docx    = None
-        self.e_ruta_imagen  = None
+        self.e_slug_actual = None
+        self.e_ruta_doc    = None
+        self.e_ruta_imagen = None
 
-        ctk.CTkLabel(padre, text="Elige una noticia para editar sus datos o reemplazar archivos.",
-                     text_color="gray", wraplength=520).pack(pady=(14, 8))
+        ctk.CTkLabel(
+            padre, text="Elige una noticia para editar sus datos o reemplazar archivos.",
+            text_color="gray", wraplength=520
+        ).pack(pady=(14, 8))
 
         self.e_menu = ctk.CTkOptionMenu(padre, values=["(sin noticias)"], command=self._e_cargar)
         self.e_menu.pack(fill="x", padx=20, pady=(0, 4))
         ctk.CTkButton(padre, text="🔄 Actualizar lista", command=self._e_refrescar_lista, height=30).pack(pady=(0, 10))
 
-        # Reemplazar Word (opcional)
-        self.e_btn_docx = ctk.CTkButton(padre, text="📄 Reemplazar Word (opcional)", command=self._e_elegir_docx)
-        self.e_btn_docx.pack(fill="x", padx=20, pady=(0, 4))
-        self.e_lbl_docx = ctk.CTkLabel(padre, text="Sin cambio — se conserva el contenido actual", text_color="gray", font=("Arial", 11))
-        self.e_lbl_docx.pack()
+        self.e_btn_doc = ctk.CTkButton(
+            padre, text="📄 Reemplazar Word/PDF (opcional)",
+            command=self._e_elegir_doc
+        )
+        self.e_btn_doc.pack(fill="x", padx=20, pady=(0, 4))
+        self.e_lbl_doc = ctk.CTkLabel(
+            padre, text="Sin cambio — se conserva el contenido actual",
+            text_color="gray", font=("Arial", 11)
+        )
+        self.e_lbl_doc.pack()
 
-        # Reemplazar foto (opcional)
-        self.e_btn_imagen = ctk.CTkButton(padre, text="🖼️ Reemplazar foto de portada (opcional)", command=self._e_elegir_imagen)
+        self.e_btn_imagen = ctk.CTkButton(
+            padre, text="🖼️ Reemplazar foto de portada (opcional)",
+            command=self._e_elegir_imagen
+        )
         self.e_btn_imagen.pack(fill="x", padx=20, pady=(6, 4))
-        self.e_lbl_imagen = ctk.CTkLabel(padre, text="Sin cambio — se conserva la foto actual", text_color="gray", font=("Arial", 11))
+        self.e_lbl_imagen = ctk.CTkLabel(
+            padre, text="Sin cambio — se conserva la foto actual",
+            text_color="gray", font=("Arial", 11)
+        )
         self.e_lbl_imagen.pack()
 
         self.e_entry_titulo    = self._campo(padre, "Título")
@@ -734,9 +1043,9 @@ class App(ctk.CTk):
         if not slug:
             return
         self.e_slug_actual = slug
-        self.e_ruta_docx   = None
+        self.e_ruta_doc    = None
         self.e_ruta_imagen = None
-        self.e_lbl_docx.configure(text="Sin cambio — se conserva el contenido actual")
+        self.e_lbl_doc.configure(text="Sin cambio — se conserva el contenido actual")
         self.e_lbl_imagen.configure(text="Sin cambio — se conserva la foto actual")
 
         meta = leer_metadata_articulo(slug)
@@ -753,15 +1062,16 @@ class App(ctk.CTk):
         self.e_lbl_estado.configure(text="")
         self.e_lbl_fecha_error.configure(text="")
 
-    def _e_elegir_docx(self):
-        ruta = elegir_archivo("Elegir nuevo Word", "Documentos Word | *.docx", [("Documentos Word", "*.docx")])
+    def _e_elegir_doc(self):
+        ruta = elegir_archivo("Elegir nuevo Word o PDF", FILTRO_DOC_ZENITY, FILTRO_DOC_TK)
         if not ruta:
             return
-        self.e_ruta_docx = Path(ruta)
-        self.e_lbl_docx.configure(text=f"Nuevo Word: {self.e_ruta_docx.name}")
+        self.e_ruta_doc = Path(ruta)
+        ext = self.e_ruta_doc.suffix.upper()
+        self.e_lbl_doc.configure(text=f"Nuevo archivo: {self.e_ruta_doc.name}  [{ext}]")
 
     def _e_elegir_imagen(self):
-        ruta = elegir_archivo("Elegir nueva foto", "Imágenes | *.jpg *.jpeg *.png *.webp", [("Imágenes", "*.jpg *.jpeg *.png *.webp")])
+        ruta = elegir_archivo("Elegir nueva foto", FILTRO_IMG_ZENITY, FILTRO_IMG_TK)
         if not ruta:
             return
         self.e_ruta_imagen = Path(ruta)
@@ -794,15 +1104,12 @@ class App(ctk.CTk):
 
         carpeta = NUEVOS / self.e_slug_actual
 
-        # Regenerar cuerpo si se eligió nuevo Word
-        if self.e_ruta_docx:
-            # Limpiar imágenes inline anteriores
+        if self.e_ruta_doc:
             inline_vieja = carpeta / "img_inline"
             if inline_vieja.exists():
                 shutil.rmtree(inline_vieja)
-            cuerpo_html = docx_a_cuerpo(self.e_ruta_docx, carpeta, self.e_slug_actual)
+            cuerpo_html = _convertir_a_cuerpo(self.e_ruta_doc, carpeta, self.e_slug_actual)
         else:
-            # Conservar el cuerpo actual del articulo.txt
             txt_actual = (carpeta / "articulo.txt").read_text(encoding="utf-8")
             _, _, cuerpo_html = txt_actual.partition("---")
             cuerpo_html = cuerpo_html.strip()
@@ -818,7 +1125,6 @@ class App(ctk.CTk):
         )
         (carpeta / "articulo.txt").write_text(contenido, encoding="utf-8")
 
-        # Reemplazar foto de portada si se eligió una nueva
         if self.e_ruta_imagen:
             for vieja in carpeta.glob("foto.*"):
                 vieja.unlink()
@@ -832,7 +1138,8 @@ class App(ctk.CTk):
             self.e_btn_guardar.configure(state="normal", text="💾 Guardar cambios y reconstruir")
             if exito:
                 self.e_lbl_estado.configure(
-                    text=f"✅ '{self.e_slug_actual}' actualizada. Recarga el navegador.", text_color="green"
+                    text=f"✅ '{self.e_slug_actual}' actualizada. Recarga el navegador.",
+                    text_color="green"
                 )
                 self._e_refrescar_lista()
                 self._d_refrescar_lista()
@@ -844,7 +1151,7 @@ class App(ctk.CTk):
         correr_build_con_log(log, al_terminar)
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  PESTAÑA: ELIMINAR / DESHACER
+    #  TAB ELIMINAR
     # ══════════════════════════════════════════════════════════════════════════
 
     def _construir_tab_eliminar(self, padre):
@@ -853,7 +1160,9 @@ class App(ctk.CTk):
             text_color="gray", wraplength=520
         ).pack(pady=(14, 10))
 
-        self.d_lbl_ultimo = ctk.CTkLabel(padre, text="Última noticia creada en esta sesión: ninguna", wraplength=520)
+        self.d_lbl_ultimo = ctk.CTkLabel(
+            padre, text="Última noticia creada en esta sesión: ninguna", wraplength=520
+        )
         self.d_lbl_ultimo.pack(pady=(0, 6))
 
         self.d_btn_deshacer = ctk.CTkButton(
@@ -862,7 +1171,8 @@ class App(ctk.CTk):
         )
         self.d_btn_deshacer.pack(pady=10, fill="x", padx=20)
 
-        ctk.CTkLabel(padre, text="— o elige cualquier noticia para eliminarla —", text_color="gray").pack(pady=(16, 6))
+        ctk.CTkLabel(padre, text="— o elige cualquier noticia para eliminarla —",
+                     text_color="gray").pack(pady=(16, 6))
 
         self.d_menu = ctk.CTkOptionMenu(padre, values=["(sin noticias)"])
         self.d_menu.pack(pady=6, fill="x", padx=20)
@@ -906,7 +1216,10 @@ class App(ctk.CTk):
         if not slug:
             messagebox.showinfo("Nada seleccionado", "No hay ninguna noticia para eliminar.")
             return
-        if not messagebox.askyesno("Confirmar eliminación", f"¿Eliminar permanentemente '{seleccion}'?\n\nEsto no se puede deshacer."):
+        if not messagebox.askyesno(
+            "Confirmar eliminación",
+            f"¿Eliminar permanentemente '{seleccion}'?\n\nEsto no se puede deshacer."
+        ):
             return
         eliminar_articulo(slug)
         if self.ultimo_slug == slug:
@@ -921,11 +1234,13 @@ class App(ctk.CTk):
             self.d_btn_eliminar.configure(state="normal")
             if exito:
                 self.d_lbl_estado.configure(
-                    text=f"✅ '{slug}' eliminada y sitio reconstruido. Recarga el navegador.", text_color="green"
+                    text=f"✅ '{slug}' eliminada y sitio reconstruido. Recarga el navegador.",
+                    text_color="green"
                 )
             else:
                 self.d_lbl_estado.configure(
-                    text=f"⚠️ Se borró la carpeta pero build.py falló (código {codigo}).", text_color="red"
+                    text=f"⚠️ Se borró la carpeta pero build.py falló (código {codigo}).",
+                    text_color="red"
                 )
             self._d_refrescar_lista()
             self._e_refrescar_lista()
