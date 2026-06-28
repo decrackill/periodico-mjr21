@@ -1,0 +1,7 @@
+titulo: Nace el periódico del MJR-21
+categoria: Comunicados
+autor: Equipo Editorial MJR-21
+fecha: 2026-06-27
+resumen: El movimiento estrena su propio espacio informativo, pensado para narrar sus procesos con transparencia y rigor.
+---
+<p>El Movimiento Juvenil Revolucionario 21 de Junio presenta hoy su propio espacio informativo.</p><p>Este periódico nace con un compromiso: contar los hechos con rigor, sin filtros partidistas, y dar voz a la juventud que vigila la democracia.</p>
