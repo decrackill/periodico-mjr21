@@ -20,8 +20,8 @@
       <span class="brand-sub">Noticias</span>
     </a>
     <nav class="main-nav">
-      <span class="nav-label">Comunicados</span>
-      <span class="nav-label">Comunidad</span>
+      <span class="nav-label" onclick="filtrar('Comunicados', this)">Comunicados</span>
+      <span class="nav-label" onclick="filtrar('Comunidad', this)">Comunidad</span>
     </nav>
   </div>
 </header>
@@ -51,6 +51,17 @@
 <footer class="news-footer">
   <p>© 2026 MJR-21 — Por dignidad, por justicia, por nuestra Colombia.</p>
 </footer>
+
+<script>
+function filtrar(categoria, el) {
+  document.querySelectorAll('.nav-label').forEach(n => n.classList.remove('active'));
+  el.classList.toggle('active');
+  const activo = el.classList.contains('active');
+  document.querySelectorAll('.news-card').forEach(card => {
+    card.style.display = (!activo || card.dataset.categoria === categoria) ? '' : 'none';
+  });
+}
+</script>
 
 </body>
 </html>

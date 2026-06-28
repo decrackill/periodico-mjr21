@@ -162,7 +162,7 @@ def limpiar_huerfanos(articulos: list, total_paginas: int):
 
 def tarjeta_html(art: dict) -> str:
     return f"""
-    <a href="/articulos/{art['slug']}/" class="news-card">
+    <a href="/articulos/{art['slug']}/" class="news-card" data-categoria="{art['categoria']}">
       <img src="{art['imagen']}" alt="{art['titulo']}" loading="lazy">
       <div class="news-card-body">
         <span class="tag-pill">{art['categoria']}</span>

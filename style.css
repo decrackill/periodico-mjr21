@@ -189,3 +189,12 @@ h1,h2,h3 { font-family: var(--ff-display); font-weight:700; color: var(--black);
     grid-template-columns: 1fr;
   }
 }
+
+.nav-label {
+  cursor: pointer;
+}
+.nav-label.active {
+  background: var(--color-accent, #c0392b);
+  color: #fff;
+  padding: 0.2rem 0.6rem;
+}
