@@ -286,8 +286,12 @@ def pdf_a_cuerpo(ruta_pdf, carpeta_slug, slug):
     """
     Convierte PDF MJR-21 → HTML.
     La portada (pág 0) se salta completamente.
-    Las tablas se reconstruyen fila por fila usando la X exacta de cada span.
-    El estado (tabla abierta, encabezados parciales) persiste entre páginas.
+    Las tablas se reconstruyen fila por fila usando la X exacta de cada span,
+    y una fila nueva solo se detecta cuando hay un salto vertical real entre
+    líneas — no simplemente porque aparezca texto en la columna izquierda
+    (eso es lo que antes partía una celda envuelta en varias líneas en
+    varias filas falsas). Las tablas también se cierran al llegar una
+    subsección nueva (2.1, 2.2...), no solo en los encabezados romanos.
     """
     doc = fitz.open(str(ruta_pdf))
     output  = []
@@ -300,12 +304,13 @@ def pdf_a_cuerpo(ruta_pdf, carpeta_slug, slug):
         carpeta_img.mkdir(parents=True, exist_ok=True)
 
     # Estado persistente entre páginas
-    en_tabla    = False
-    filas_tabla = []      # filas HTML acumuladas de la tabla actual
-    buf_izq     = []      # líneas de texto de la celda izquierda actual
-    buf_der     = []      # líneas de texto de la celda derecha actual
-    buf_h2      = []      # palabras del encabezado romano en curso
-    buf_h3      = []      # palabras de la subsección en curso
+    en_tabla      = False
+    filas_tabla   = []      # filas HTML acumuladas de la tabla actual
+    buf_izq       = []      # líneas de texto de la celda izquierda actual
+    buf_der       = []      # líneas de texto de la celda derecha actual
+    buf_h2        = []      # palabras del encabezado romano en curso
+    buf_h3        = []      # palabras de la subsección en curso
+    y_fila_actual = None    # Y de la última línea agregada a la fila en curso
 
     def flush_h2():
         if buf_h2:
@@ -391,7 +396,6 @@ def pdf_a_cuerpo(ruta_pdf, carpeta_slug, slug):
                 img_counter += 1
 
         # ── Extraer spans de la página ─────────────────────────────────────
-        # Cada span: (y, x, sz, bold, rgb, text)
         raw_spans = []
         for blk in pagina.get_text("rawdict", flags=0)["blocks"]:
             if blk["type"] != 0:
@@ -412,10 +416,8 @@ def pdf_a_cuerpo(ruta_pdf, carpeta_slug, slug):
         if not raw_spans:
             continue
 
-        # Ordenar por Y luego X
         raw_spans.sort(key=lambda s: (round(s[0] / 4) * 4, s[1]))
 
-        # Agrupar en "líneas lógicas" por Y±4px
         lineas_logicas = []
         for sp in raw_spans:
             y = sp[0]
@@ -426,100 +428,94 @@ def pdf_a_cuerpo(ruta_pdf, carpeta_slug, slug):
 
         # ── Procesar cada línea lógica ─────────────────────────────────────
         for linea in lineas_logicas:
-            # Propiedades del primer span de la línea
             y0, x0_primero, sz0, bold0, rgb0, _ = linea[0]
-
-            # Texto completo de la línea
             texto_full = " ".join(sp[5] for sp in linea).strip()
             if not texto_full:
                 continue
 
-            # ── 1. Filtrar ruido ──────────────────────────────────────────
             if _es_gris(rgb0):
                 continue
             if _PAT_PAG.match(texto_full):
                 continue
             if len(texto_full) < 3 and not any(c.isalpha() for c in texto_full):
                 continue
-            # Encabezado del movimiento en zona header (azul pequeño, y < 100)
             if y0 < 100 and sz0 <= 10:
                 continue
 
-            # ── 2. Header de tabla (texto blanco) ────────────────────────
+            # ── Header de tabla (texto blanco) ──────────────────────────
             if all(_cerca(sp[4], _BLANCO, 15) for sp in linea):
-                # Es el encabezado azul de la tabla con texto blanco
-                # Si había h2/h3 pendiente, flushearlo antes
                 flush_h2()
                 flush_h3()
-                # Si ya había una tabla abierta, cerrarla (nueva tabla)
                 if en_tabla:
                     flush_tabla()
                 en_tabla = True
+                y_fila_actual = None
                 continue
 
-            # ── 3. Encabezado romano (I., II., ...) ──────────────────────
-            # Detectar por PATRÓN de texto (independiente del color)
+            # ── Encabezado romano (I., II., ...) ─────────────────────────
             if _PAT_ROMANO.match(texto_full.strip()) and sz0 >= 13:
                 if en_tabla:
                     flush_tabla()
                 flush_h2()
                 flush_h3()
-                # Iniciar nuevo h2
                 buf_h2.append(texto_full)
                 continue
 
-            # ── 4. Continuación de encabezado romano partido ──────────────
-            # (mismo color de sección, sz >= 13, sin ser inicio de nueva sección)
+            # ── Continuación de encabezado romano partido ────────────────
             if buf_h2 and not en_tabla and sz0 >= 13 and _es_h_romano(rgb0, sz0):
                 buf_h2.append(texto_full)
                 continue
 
-            # ── 5. Subsección N.N Título ──────────────────────────────────
+            # ── Subsección N.N Título ─────────────────────────────────────
+            # CORREGIDO: ahora cierra cualquier tabla que haya quedado
+            # abierta de la sección anterior antes de empezar la nueva.
             if _PAT_SUBSEC.match(texto_full.strip()) and sz0 >= 11:
+                if en_tabla:
+                    flush_tabla()
                 flush_h3()
                 flush_h2()
                 buf_h3.append(texto_full)
                 continue
 
-            # ── 6. Continuación de subsección partida ─────────────────────
+            # ── Continuación de subsección partida ────────────────────────
             if buf_h3 and not en_tabla and sz0 >= 11 and _es_subseccion(rgb0, sz0):
                 buf_h3.append(texto_full)
                 continue
 
-            # ── 7. Contenido de tabla ─────────────────────────────────────
+            # ── Contenido de tabla ─────────────────────────────────────────
+            # CORREGIDO: una fila nueva solo se abre si hubo un salto
+            # vertical real (más de ~1.8x el tamaño de letra) respecto a
+            # la última línea de tabla procesada. Si el salto es chico,
+            # es la misma celda continuando en la siguiente línea.
             if en_tabla:
-                # Separar los spans de la línea en col izq y col der
-                # usando la X EXACTA de cada span individual
+                if y_fila_actual is not None and (y0 - y_fila_actual) > sz0 * 1.8:
+                    flush_fila()
+                y_fila_actual = y0
+
                 spans_izq = [sp for sp in linea if sp[1] < _COL_SPLIT]
                 spans_der = [sp for sp in linea if sp[1] >= _COL_SPLIT]
-
                 texto_izq = " ".join(sp[5] for sp in spans_izq).strip()
                 texto_der = " ".join(sp[5] for sp in spans_der).strip()
 
                 if texto_izq:
-                    # Nueva celda izquierda → cerrar fila anterior
-                    if buf_izq or buf_der:
-                        flush_fila()
                     buf_izq.append(texto_izq)
-
                 if texto_der:
                     buf_der.append(texto_der)
 
                 continue
 
-            # ── 8. Párrafo normal ─────────────────────────────────────────
+            # ── Párrafo normal ────────────────────────────────────────────
             flush_h2()
             flush_h3()
 
             partes_html = []
             for sp in linea:
                 t = _escape(sp[5])
-                if sp[3]:   # bold
+                if sp[3]:
                     t = f"<strong>{t}</strong>"
                 partes_html.append(t)
             output.append(f"<p>{''.join(partes_html)}</p>")
 
-    # ── Cerrar todo al terminar el documento ──────────────────────────────
     if en_tabla:
         flush_tabla()
     flush_h2()
