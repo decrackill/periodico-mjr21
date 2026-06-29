@@ -209,131 +209,145 @@ def primer_titulo(ruta_docx):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONVERSIÓN PDF → HTML  (reescrita completa)
+#  CONVERSIÓN PDF → HTML
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _color_rgb(c):
-    return ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)
+def _rgb(color_int):
+    return ((color_int >> 16) & 0xFF, (color_int >> 8) & 0xFF, color_int & 0xFF)
 
 
-def _similar_color(c1, c2, tol=40):
+def _cerca(c1, c2, tol=25):
     return all(abs(a - b) <= tol for a, b in zip(c1, c2))
 
 
-# Paleta del PDF MJR-21
-_AZUL_OSC  = (26,  63,  160)   # encabezados romanos, celdas izq tabla
-_AZUL_MED  = (0,   70,  127)   # variante azul medio
-_ROJO      = (192, 57,  43)    # subsecciones N.N Título
-_ROJO_OSC  = (180, 0,   0)     # variante rojo oscuro
-_SALMON    = (255, 180, 160)   # fondo de encabezados romanos grandes
-_BLANCO    = (255, 255, 255)   # texto blanco en header de tabla
-_GRIS      = (130, 130, 130)   # pie de página, números
-_GRIS_CLR  = (160, 160, 160)   # gris más claro
-_NEGRO     = (0,   0,   0)     # texto cuerpo negro puro
-_OSCURO    = (30,  30,  46)    # texto cuerpo oscuro
-_VERDE     = (0,   128, 0)     # variante verde tabla
+# Colores exactos del PDF MJR-21 (verificados span a span)
+_AZUL    = (26,  63,  160)   # encabezados I/IV/VII/VIII + col izquierda tabla
+_VERDE   = (26,  122, 60)    # encabezados II/V/VIII
+_AMARILLO= (245, 197, 24)    # encabezado X
+_ROJO    = (192, 57,  43)    # encabezados III/VI/IX + subsecciones
+_AZUL2   = (46,  74,  158)   # subsecciones alternativas (2.1)
+_BLANCO  = (255, 255, 255)   # texto en header de tabla (fondo azul)
+_OSCURO  = (30,  30,  46)    # texto de cuerpo (col derecha tabla + párrafos)
+_GRIS    = (136, 136, 136)   # pie de página
+
+# X fijo de separación de columnas (verificado en el PDF real)
+# Col izquierda: x ≈ 72  |  Col derecha: x ≈ 202
+_COL_SPLIT = 190  # cualquier span con x >= 190 es columna derecha
 
 
-def _es_azul(rgb):
-    return _similar_color(rgb, _AZUL_OSC) or _similar_color(rgb, _AZUL_MED, 30)
+def _es_h_romano(rgb, sz):
+    """Encabezados tipo I., II., ..., X. — tamaño 15, cualquier color de sección."""
+    if sz < 14:
+        return False
+    return (_cerca(rgb, _AZUL) or _cerca(rgb, _VERDE) or
+            _cerca(rgb, _ROJO) or _cerca(rgb, _AMARILLO, 30))
 
 
-def _es_rojo(rgb):
-    return _similar_color(rgb, _ROJO) or _similar_color(rgb, _ROJO_OSC, 30)
+def _es_subseccion(rgb, sz):
+    """Subsecciones tipo 1.1, 2.2 — tamaño ~12, rojo o azul2."""
+    if sz < 11:
+        return False
+    return _cerca(rgb, _ROJO) or _cerca(rgb, _AZUL2, 20)
+
+
+def _es_col_izq(rgb, bold, x):
+    """Celda izquierda de tabla: azul bold, x < _COL_SPLIT."""
+    return x < _COL_SPLIT and bold and _cerca(rgb, _AZUL)
+
+
+def _es_col_der(rgb, x):
+    """Celda derecha de tabla: oscuro, x >= _COL_SPLIT."""
+    return x >= _COL_SPLIT and (_cerca(rgb, _OSCURO, 30) or
+                                 (rgb[0] < 80 and rgb[1] < 80 and rgb[2] < 80))
 
 
 def _es_gris(rgb):
-    return _similar_color(rgb, _GRIS, 30) or _similar_color(rgb, _GRIS_CLR, 30)
-
-
-def _es_oscuro(rgb):
-    return (_similar_color(rgb, _OSCURO, 40)
-            or _similar_color(rgb, _NEGRO, 40)
-            or (rgb[0] < 80 and rgb[1] < 80 and rgb[2] < 80))
-
-
-def _es_blanco(rgb):
-    return all(c >= 220 for c in rgb)
+    return _cerca(rgb, _GRIS, 30)
 
 
 def _escape(t):
     return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _es_logo(img_bbox, page_height, w, h):
-    """Detecta logos de encabezado/pie: pequeños y en zona marginal."""
-    x0, y0, x1, y1 = img_bbox
-    en_header = y0 < page_height * 0.22
-    en_footer  = y1 > page_height * 0.82
-    pequena    = w < 200 or h < 200
-    return (en_header or en_footer) and pequena
+def _es_logo_img(bbox, page_h, iw, ih):
+    x0, y0, x1, y1 = bbox
+    en_margen = y0 < page_h * 0.22 or y1 > page_h * 0.82
+    return en_margen and (iw < 200 or ih < 200)
+
+
+# Patrones de texto para detección de estructura
+_PAT_ROMANO    = re.compile(r'^[IVXLCDM]+\.\s+\S', re.IGNORECASE)
+_PAT_SUBSEC    = re.compile(r'^\d+\.\d+[\s\.]')
+_PAT_PAG       = re.compile(r'^\s*(Pág\.\s*\d+|MJR-21\s*•|\d+\s*$)')
+_PAT_HDR_TABLA = re.compile(r'DISPOSICI[OÓ]N|CONTENIDO\s+DE\s+LA', re.IGNORECASE)
 
 
 def pdf_a_cuerpo(ruta_pdf, carpeta_slug, slug):
     """
-    Convierte PDF → HTML. Las tablas y los encabezados romanos pueden
-    seguir abiertos a través de un salto de página (el estado NO se
-    reinicia por página), y la separación de columnas en tablas se hace
-    span por span, nunca con la línea completa mezclada.
+    Convierte PDF MJR-21 → HTML.
+    La portada (pág 0) se salta completamente.
+    Las tablas se reconstruyen fila por fila usando la X exacta de cada span.
+    El estado (tabla abierta, encabezados parciales) persiste entre páginas.
     """
-    doc    = fitz.open(str(ruta_pdf))
-    output = []
+    doc = fitz.open(str(ruta_pdf))
+    output  = []
     xrefs_vistos = set()
+    carpeta_img  = None
+    img_counter  = 0
 
-    carpeta_img = None
-    img_counter = 0
     if carpeta_slug:
         carpeta_img = carpeta_slug / "img_inline"
         carpeta_img.mkdir(parents=True, exist_ok=True)
 
-    # Estado que persiste ENTRE páginas — una tabla o un encabezado
-    # pueden partirse por un salto de página y deben poder continuar.
+    # Estado persistente entre páginas
     en_tabla    = False
-    filas_tabla = []
-    buf_izq     = []
-    buf_der     = []
-    buf_h2      = []
-    buf_h3      = []
+    filas_tabla = []      # filas HTML acumuladas de la tabla actual
+    buf_izq     = []      # líneas de texto de la celda izquierda actual
+    buf_der     = []      # líneas de texto de la celda derecha actual
+    buf_h2      = []      # palabras del encabezado romano en curso
+    buf_h3      = []      # palabras de la subsección en curso
 
-    def _flush_h2():
+    def flush_h2():
         if buf_h2:
-            texto = " ".join(buf_h2).strip()
+            txt = " ".join(buf_h2).strip()
             output.append(
                 f'<h2 style="color:#1a3fa0;border-left:5px solid #1a3fa0;'
-                f'padding-left:0.7em;margin:1.8em 0 0.4em;font-size:1.2rem">'
-                f'{_escape(texto)}</h2>'
+                f'padding-left:0.7em;margin:1.8em 0 0.5em;font-size:1.25rem;font-weight:700">'
+                f'{_escape(txt)}</h2>'
             )
             buf_h2.clear()
 
-    def _flush_h3():
+    def flush_h3():
         if buf_h3:
-            texto = " ".join(buf_h3).strip()
+            txt = " ".join(buf_h3).strip()
             output.append(
-                f'<h3 style="color:#c0392b;margin:1.3em 0 0.3em;font-size:1.05rem">'
-                f'{_escape(texto)}</h3>'
+                f'<h3 style="color:#c0392b;margin:1.2em 0 0.3em;font-size:1.05rem;font-weight:700">'
+                f'{_escape(txt)}</h3>'
             )
             buf_h3.clear()
 
-    def _flush_fila():
+    def flush_fila():
+        """Cierra la fila actual de tabla y la agrega a filas_tabla."""
         if buf_izq or buf_der:
             izq = " ".join(buf_izq).strip()
             der = " ".join(buf_der).strip()
-            if izq or der:
-                filas_tabla.append(
-                    f"<tr><td><strong style=\"color:#1a3fa0\">{_escape(izq)}</strong></td>"
-                    f"<td>{_escape(der)}</td></tr>"
-                )
+            filas_tabla.append(
+                f"<tr>"
+                f'<td><strong style="color:#1a3fa0">{_escape(izq)}</strong></td>'
+                f"<td>{_escape(der)}</td>"
+                f"</tr>"
+            )
             buf_izq.clear()
             buf_der.clear()
 
-    def _flush_tabla():
+    def flush_tabla():
         nonlocal en_tabla
-        _flush_fila()
+        flush_fila()
         if filas_tabla:
             hdr = (
                 "<tr>"
-                '<th style="background:#1a3fa0;color:#fff;padding:.5rem .8rem">DISPOSICIÓN CONSTITUCIONAL</th>'
-                '<th style="background:#1a3fa0;color:#fff;padding:.5rem .8rem">CONTENIDO DE LA PROPUESTA</th>'
+                '<th style="background:#1a3fa0;color:#fff;padding:.5rem .9rem;text-align:left">DISPOSICIÓN CONSTITUCIONAL</th>'
+                '<th style="background:#1a3fa0;color:#fff;padding:.5rem .9rem;text-align:left">CONTENIDO DE LA PROPUESTA</th>'
                 "</tr>"
             )
             output.append(
@@ -342,32 +356,32 @@ def pdf_a_cuerpo(ruta_pdf, carpeta_slug, slug):
             filas_tabla.clear()
         en_tabla = False
 
-    patron_romano      = re.compile(r'^([IVXLCDM]+)\.\s+\S')
-    patron_subseccion  = re.compile(r'^\d+\.\d+\s')
+    # ── Iterar páginas ─────────────────────────────────────────────────────
 
     for num_pag, pagina in enumerate(doc):
-        page_rect = pagina.rect
-        page_w, page_h = page_rect.width, page_rect.height
+        page_h = pagina.rect.height
+        page_w = pagina.rect.width
 
-        # ── Imágenes (saltar portada pág 0) ───────────────────────────────
-        if carpeta_img and num_pag > 0:
+        # SALTAR PORTADA COMPLETA (pág 0)
+        if num_pag == 0:
+            continue
+
+        # ── Imágenes ───────────────────────────────────────────────────────
+        if carpeta_img:
             for img_info in pagina.get_images(full=True):
                 xref = img_info[0]
                 if xref in xrefs_vistos:
                     continue
                 base = doc.extract_image(xref)
                 iw, ih = base["width"], base["height"]
-                bbox_list = pagina.get_image_rects(xref)
-                bbox = bbox_list[0] if bbox_list else None
-                if bbox and _es_logo(bbox, page_h, iw, ih):
-                    xrefs_vistos.add(xref)
-                    continue
+                bboxes = pagina.get_image_rects(xref)
+                bbox = bboxes[0] if bboxes else None
+                if bbox and _es_logo_img(bbox, page_h, iw, ih):
+                    xrefs_vistos.add(xref); continue
                 if iw < 80 or ih < 80:
-                    xrefs_vistos.add(xref)
-                    continue
+                    xrefs_vistos.add(xref); continue
                 xrefs_vistos.add(xref)
-                ext    = base["ext"]
-                nombre = f"pdf_img_{img_counter}.{ext}"
+                nombre = f"pdf_img_{img_counter}.{base['ext']}"
                 (carpeta_img / nombre).write_bytes(base["image"])
                 ruta_pub = f"/img/articulos/{slug}/img_inline/{nombre}"
                 output.append(
@@ -377,144 +391,147 @@ def pdf_a_cuerpo(ruta_pdf, carpeta_slug, slug):
                 img_counter += 1
 
         # ── Extraer spans de la página ─────────────────────────────────────
-        raw = pagina.get_text("rawdict", flags=0)["blocks"]
-        spans = []
-        for blk in raw:
+        # Cada span: (y, x, sz, bold, rgb, text)
+        raw_spans = []
+        for blk in pagina.get_text("rawdict", flags=0)["blocks"]:
             if blk["type"] != 0:
                 continue
             for linea in blk["lines"]:
                 ly0 = linea["bbox"][1]
                 for span in linea["spans"]:
                     chars = span.get("chars", [])
-                    text = "".join(c["c"] for c in chars).strip()
+                    text  = "".join(c["c"] for c in chars).strip()
                     if not text:
                         continue
-                    rgb = _color_rgb(span["color"])
-                    spans.append((
-                        ly0, span["bbox"][0], span["bbox"][2], span["size"],
-                        bool(span["flags"] & 16), bool(span["flags"] & 2), rgb, text
-                    ))
+                    rgb  = _rgb(span["color"])
+                    sz   = span["size"]
+                    bold = bool(span["flags"] & 16)
+                    x0   = span["bbox"][0]
+                    raw_spans.append((ly0, x0, sz, bold, rgb, text))
 
-        if not spans:
+        if not raw_spans:
             continue
 
-        xs_col_der = [
-            s[1] for s in spans
-            if (_es_oscuro(s[6]) or _es_blanco(s[6])) and s[1] > page_w * 0.35
-        ]
-        col_split = min(xs_col_der) if xs_col_der else page_w * 0.40
+        # Ordenar por Y luego X
+        raw_spans.sort(key=lambda s: (round(s[0] / 4) * 4, s[1]))
 
-        spans_sorted = sorted(spans, key=lambda s: (round(s[0] / 5) * 5, s[1]))
-        lineas = []
-        for sp in spans_sorted:
+        # Agrupar en "líneas lógicas" por Y±4px
+        lineas_logicas = []
+        for sp in raw_spans:
             y = sp[0]
-            if lineas and abs(y - lineas[-1][0][0]) <= 5:
-                lineas[-1].append(sp)
+            if lineas_logicas and abs(y - lineas_logicas[-1][0][0]) <= 4:
+                lineas_logicas[-1].append(sp)
             else:
-                lineas.append([sp])
+                lineas_logicas.append([sp])
 
-        for linea in lineas:
-            y0, x0, _, sz0, bold0, _, rgb0, _ = linea[0]
-            texto = " ".join(sp[7] for sp in linea).strip()
-            if not texto:
+        # ── Procesar cada línea lógica ─────────────────────────────────────
+        for linea in lineas_logicas:
+            # Propiedades del primer span de la línea
+            y0, x0_primero, sz0, bold0, rgb0, _ = linea[0]
+
+            # Texto completo de la línea
+            texto_full = " ".join(sp[5] for sp in linea).strip()
+            if not texto_full:
                 continue
-            texto_mayus = texto.upper()
 
-            # ── Ruido ────────────────────────────────────────────────────
+            # ── 1. Filtrar ruido ──────────────────────────────────────────
             if _es_gris(rgb0):
                 continue
-            if re.match(r'^\s*Pág\.\s*\d+\s*$', texto) or re.match(r'^\s*\d+\s*$', texto):
+            if _PAT_PAG.match(texto_full):
                 continue
-            if len(texto) < 3 and not any(c.isalpha() for c in texto):
+            if len(texto_full) < 3 and not any(c.isalpha() for c in texto_full):
                 continue
-            if _es_azul(rgb0) and sz0 <= 11 and y0 < page_h * 0.18:
-                continue  # logo pequeño de encabezado/pie
+            # Encabezado del movimiento en zona header (azul pequeño, y < 100)
+            if y0 < 100 and sz0 <= 10:
+                continue
 
-            # ── Encabezado romano (I., II., III., IV., V., VI., ...) ──────
-            # Se detecta por el PATRÓN del texto, no por el color: en este
-            # PDF el color de relleno de estos títulos no es constante.
-            if patron_romano.match(texto.strip()) and sz0 >= 11:
+            # ── 2. Header de tabla (texto blanco) ────────────────────────
+            if all(_cerca(sp[4], _BLANCO, 15) for sp in linea):
+                # Es el encabezado azul de la tabla con texto blanco
+                # Si había h2/h3 pendiente, flushearlo antes
+                flush_h2()
+                flush_h3()
+                # Si ya había una tabla abierta, cerrarla (nueva tabla)
                 if en_tabla:
-                    _flush_tabla()
-                _flush_h2()
-                buf_h2.append(texto)
-                _flush_h3()
-                continue
-
-            # ── Subsección N.N Título ──────────────────────────────────────
-            if patron_subseccion.match(texto.strip()) and sz0 >= 9:
-                _flush_h3()
-                _flush_h2()
-                buf_h3.append(texto)
-                continue
-
-            # Continuación de un encabezado romano partido en varias líneas
-            if buf_h2 and not buf_h3 and not en_tabla and sz0 >= 11 \
-               and not _es_oscuro(rgb0) and not _es_gris(rgb0):
-                buf_h2.append(texto)
-                continue
-
-            # Continuación de una subsección partida en varias líneas
-            if buf_h3 and not en_tabla and sz0 >= 9 \
-               and not _es_oscuro(rgb0) and not _es_gris(rgb0):
-                buf_h3.append(texto)
-                continue
-
-            # ── Encabezado literal de la tabla de dos columnas ─────────────
-            if len(texto) < 90 and "CONTENIDO" in texto_mayus and \
-               ("DISPOSICIÓN" in texto_mayus or "DISPOSICION" in texto_mayus):
-                _flush_h2()
-                _flush_h3()
+                    flush_tabla()
                 en_tabla = True
                 continue
 
-            # ── Contenido de tabla: separar por columna usando la X real
-            #    de CADA span — nunca la línea completa mezclada ───────────
-            if en_tabla:
-                izq_spans = [sp for sp in linea if sp[1] < col_split]
-                der_spans = [sp for sp in linea if sp[1] >= col_split]
-                texto_izq = " ".join(sp[7] for sp in izq_spans).strip()
-                texto_der = " ".join(sp[7] for sp in der_spans).strip()
-
-                if texto_izq and buf_der:
-                    _flush_fila()
-                if texto_izq:
-                    buf_izq.append(texto_izq)
-                if texto_der:
-                    buf_der.append(texto_der)
+            # ── 3. Encabezado romano (I., II., ...) ──────────────────────
+            # Detectar por PATRÓN de texto (independiente del color)
+            if _PAT_ROMANO.match(texto_full.strip()) and sz0 >= 13:
+                if en_tabla:
+                    flush_tabla()
+                flush_h2()
+                flush_h3()
+                # Iniciar nuevo h2
+                buf_h2.append(texto_full)
                 continue
 
-            # ── Párrafo normal ───────────────────────────────────────────
+            # ── 4. Continuación de encabezado romano partido ──────────────
+            # (mismo color de sección, sz >= 13, sin ser inicio de nueva sección)
+            if buf_h2 and not en_tabla and sz0 >= 13 and _es_h_romano(rgb0, sz0):
+                buf_h2.append(texto_full)
+                continue
+
+            # ── 5. Subsección N.N Título ──────────────────────────────────
+            if _PAT_SUBSEC.match(texto_full.strip()) and sz0 >= 11:
+                flush_h3()
+                flush_h2()
+                buf_h3.append(texto_full)
+                continue
+
+            # ── 6. Continuación de subsección partida ─────────────────────
+            if buf_h3 and not en_tabla and sz0 >= 11 and _es_subseccion(rgb0, sz0):
+                buf_h3.append(texto_full)
+                continue
+
+            # ── 7. Contenido de tabla ─────────────────────────────────────
             if en_tabla:
-                _flush_tabla()
-            _flush_h2()
-            _flush_h3()
+                # Separar los spans de la línea en col izq y col der
+                # usando la X EXACTA de cada span individual
+                spans_izq = [sp for sp in linea if sp[1] < _COL_SPLIT]
+                spans_der = [sp for sp in linea if sp[1] >= _COL_SPLIT]
+
+                texto_izq = " ".join(sp[5] for sp in spans_izq).strip()
+                texto_der = " ".join(sp[5] for sp in spans_der).strip()
+
+                if texto_izq:
+                    # Nueva celda izquierda → cerrar fila anterior
+                    if buf_izq or buf_der:
+                        flush_fila()
+                    buf_izq.append(texto_izq)
+
+                if texto_der:
+                    buf_der.append(texto_der)
+
+                continue
+
+            # ── 8. Párrafo normal ─────────────────────────────────────────
+            flush_h2()
+            flush_h3()
 
             partes_html = []
             for sp in linea:
-                t = _escape(sp[7])
-                if sp[4] and sp[5]:
-                    t = f"<strong><em>{t}</em></strong>"
-                elif sp[4]:
+                t = _escape(sp[5])
+                if sp[3]:   # bold
                     t = f"<strong>{t}</strong>"
-                elif sp[5]:
-                    t = f"<em>{t}</em>"
                 partes_html.append(t)
             output.append(f"<p>{''.join(partes_html)}</p>")
 
-    # Cerrar lo que haya quedado abierto al terminar TODO el documento
+    # ── Cerrar todo al terminar el documento ──────────────────────────────
     if en_tabla:
-        _flush_tabla()
-    _flush_h2()
-    _flush_h3()
+        flush_tabla()
+    flush_h2()
+    flush_h3()
 
     doc.close()
 
     # ── Post-proceso: fusionar <p> consecutivos ────────────────────────────
     resultado = []
-    buf_p     = []
+    buf_p = []
 
-    def _volcar_p():
+    def volcar_p():
         if buf_p:
             resultado.append("<p>" + " ".join(buf_p) + "</p>")
             buf_p.clear()
@@ -524,9 +541,9 @@ def pdf_a_cuerpo(ruta_pdf, carpeta_slug, slug):
             inner = re.sub(r'^<p>(.*)</p>$', r'\1', bloque, flags=re.DOTALL)
             buf_p.append(inner)
         else:
-            _volcar_p()
+            volcar_p()
             resultado.append(bloque)
-    _volcar_p()
+    volcar_p()
 
     return "\n\n".join(resultado)
 
@@ -543,8 +560,8 @@ def primer_titulo_pdf(ruta_pdf):
                     chars = span.get("chars", [])
                     text  = "".join(c["c"] for c in chars).strip()
                     if text and span["size"] >= 12:
-                        rgb = _color_rgb(span["color"])
-                        if not _es_gris(rgb) and not _es_blanco(rgb):
+                        rgb = _rgb(span["color"])
+                        if not _es_gris(rgb) and not _cerca(rgb, _BLANCO, 15):
                             candidatos.append((span["size"], text))
         if candidatos:
             break
@@ -713,8 +730,8 @@ class VentanaPreview(ctk.CTkToplevel):
             self._imagenes_tk.append(photo)
             txt.image_create("end", image=photo, padx=4, pady=8)
             txt.insert("end", "\n")
-        except Exception as e:
-            txt.insert("end", f"[📷 Imagen no disponible]\n", "img_label")
+        except Exception:
+            txt.insert("end", "[📷 Imagen no disponible]\n", "img_label")
 
     def _renderizar_html(self, txt, html):
         import re as _re
@@ -732,7 +749,7 @@ class VentanaPreview(ctk.CTkToplevel):
                     src = src_match.group(1)
                     ruta_local = None
                     if self._carpeta_preview:
-                        nombre = Path(src).name
+                        nombre    = Path(src).name
                         candidata = self._carpeta_preview / "img_inline" / nombre
                         if candidata.exists():
                             ruta_local = candidata
@@ -884,9 +901,7 @@ class App(ctk.CTk):
         entry.pack(pady=pady, fill="x", padx=20)
         return entry
 
-    # ══════════════════════════════════════════════════════════════════════════
-    #  TAB CREAR
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── TAB CREAR ─────────────────────────────────────────────────────────
 
     def _construir_tab_crear(self, padre):
         self.c_ruta_doc    = None
@@ -1052,9 +1067,7 @@ class App(ctk.CTk):
 
         correr_build_con_log(log, al_terminar)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    #  TAB EDITAR
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── TAB EDITAR ────────────────────────────────────────────────────────
 
     def _construir_tab_editar(self, padre):
         self.e_slug_actual = None
@@ -1232,9 +1245,7 @@ class App(ctk.CTk):
 
         correr_build_con_log(log, al_terminar)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    #  TAB ELIMINAR
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── TAB ELIMINAR ──────────────────────────────────────────────────────
 
     def _construir_tab_eliminar(self, padre):
         ctk.CTkLabel(
