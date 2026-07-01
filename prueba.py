@@ -1,5 +1,5 @@
 """
-Generador de Noticias — MJR-21
+Generador de Noticias — JRC-21
 Lee un Word (.docx) o PDF con negrillas/cursivas/párrafos/tablas/imágenes y genera
 la carpeta nuevos/{slug}/ lista, luego corre build.py.
 Pestañas: Crear noticia | Editar noticia | Eliminar / deshacer
@@ -220,7 +220,7 @@ def _cerca(c1, c2, tol=25):
     return all(abs(a - b) <= tol for a, b in zip(c1, c2))
 
 
-# Colores exactos del PDF MJR-21 (verificados span a span)
+# Colores exactos del PDF JRC-21 (verificados span a span)
 _AZUL    = (26,  63,  160)   # encabezados I/IV/VII/VIII + col izquierda tabla
 _VERDE   = (26,  122, 60)    # encabezados II/V/VIII
 _AMARILLO= (245, 197, 24)    # encabezado X
@@ -278,13 +278,13 @@ def _es_logo_img(bbox, page_h, iw, ih):
 # Patrones de texto para detección de estructura
 _PAT_ROMANO    = re.compile(r'^[IVXLCDM]+\.\s+\S', re.IGNORECASE)
 _PAT_SUBSEC    = re.compile(r'^\d+\.\d+[\s\.]')
-_PAT_PAG       = re.compile(r'^\s*(Pág\.\s*\d+|MJR-21\s*•|\d+\s*$)')
+_PAT_PAG       = re.compile(r'^\s*(Pág\.\s*\d+|JRC-21\s*•|\d+\s*$)')
 _PAT_HDR_TABLA = re.compile(r'DISPOSICI[OÓ]N|CONTENIDO\s+DE\s+LA', re.IGNORECASE)
 
 
 def pdf_a_cuerpo(ruta_pdf, carpeta_slug, slug):
     """
-    Convierte PDF MJR-21 → HTML.
+    Convierte PDF JRC-21 → HTML.
     La portada (pág 0) se salta completamente.
 
     Las dos columnas de cada tabla ya NO se separan por posición X (eso
@@ -863,12 +863,12 @@ def correr_build_con_log(ventana_log, callback_fin):
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Generador de Noticias — MJR-21")
+        self.title("Generador de Noticias — JRC-21")
         self.geometry("660x820")
         self.ultimo_slug = None
 
         ctk.CTkLabel(self, text="Generador de Noticias", font=("Arial", 20, "bold")).pack(pady=(20, 4))
-        ctk.CTkLabel(self, text="MJR-21 — Departamento de Periodismo", text_color="gray").pack(pady=(0, 14))
+        ctk.CTkLabel(self, text="JRC-21 — Departamento de Periodismo", text_color="gray").pack(pady=(0, 14))
 
         self.tabs = ctk.CTkTabview(self, width=600, height=700)
         self.tabs.pack(padx=20, pady=10, fill="both", expand=True)
@@ -984,7 +984,7 @@ class App(ctk.CTk):
             return
 
         import tempfile
-        carpeta_temp = Path(tempfile.mkdtemp(prefix="mjr21_preview_"))
+        carpeta_temp = Path(tempfile.mkdtemp(prefix="JRC21_preview_"))
         self._carpeta_preview_temp = carpeta_temp
 
         slug_preview = slugify(titulo)
