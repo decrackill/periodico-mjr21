@@ -1,6 +1,6 @@
-titulo: Nace el periódico del MJR-21
+titulo: Nace el periódico del JRC-21
 categoria: Comunicados
-autor: Equipo Editorial MJR-21
+autor: Equipo Editorial JRC-21
 fecha: 2026-06-27
 resumen: El movimiento estrena su propio espacio informativo, pensado para narrar sus procesos con transparencia y rigor.
 ---
